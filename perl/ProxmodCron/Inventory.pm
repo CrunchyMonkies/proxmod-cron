@@ -43,8 +43,9 @@ Every cron entry on the host, as a list of records:
 
 C<< { source, path, line, user, schedule, command, next_run, owner, note } >>
 
-C<owner> is C<proxmod-cron> for lines in the files we generate and C<system>
-for everything else. Foreign entries are never editable through the API.
+C<owner> is C<proxmod-cron> for lines in the files we generate and in the anchor
+we ship, and C<system> for everything else. Foreign entries are never editable
+through the API.
 
 =cut
 
@@ -100,10 +101,18 @@ sub _cron_d {
         my $path = "$dir/$name";
         next if !-f $path;
 
-        my $ours = ($name eq ProxmodCron::Render::filename('cluster')
+        my $anchor = ($name eq ProxmodCron::Render::anchor_filename()) ? 1 : 0;
+
+        my $ours = ($anchor
+            || $name eq ProxmodCron::Render::filename('cluster')
             || $name eq ProxmodCron::Render::filename('node')) ? 1 : 0;
 
         my $note;
+        # Ours, and the only entry here that is not a job. Said plainly, because
+        # a line running every minute with no schedule anyone chose is exactly
+        # the kind of thing an administrator reasonably wants explained.
+        $note = 'the proxmod-cron anchor: it renders the generated files and'
+            . ' is not a scheduled job' if $anchor;
         $note = "cron ignores this file: the name contains a character cron does not accept"
             if $name !~ $VALID_NAME;
 

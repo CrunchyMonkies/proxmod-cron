@@ -33,6 +33,13 @@ my %FILENAME = (
     node => 'proxmod-cron-node',
 );
 
+# The anchor: the conffile whose single line runs proxmod-cron-sync every
+# minute, which is the whole convergence mechanism. It is not generated and it
+# is not a job anyone scheduled, but it is unambiguously ours — so it is named
+# here, beside the files it produces, rather than spelled out again in each
+# place that has to recognise it.
+our $ANCHOR = 'proxmod-cron';
+
 =head2 filename($scope)
 
 The generated file's base name. No '.' in it, ever: cron ignores a file in
@@ -48,6 +55,22 @@ sub filename {
 sub path {
     my ($scope) = @_;
     return ProxmodCron::Config::cron_d() . '/' . filename($scope);
+}
+
+=head2 anchor_filename() / anchor_path()
+
+The anchor conffile. One definition, shared by the inventory (which must not
+report our own file as somebody else's) and by C<proxmod-cronctl doctor> (which
+checks it exists, because without it nothing renders and nothing runs).
+
+=cut
+
+sub anchor_filename {
+    return $ANCHOR;
+}
+
+sub anchor_path {
+    return ProxmodCron::Config::cron_d() . '/' . $ANCHOR;
 }
 
 =head2 render($scope, $store, $nodename)

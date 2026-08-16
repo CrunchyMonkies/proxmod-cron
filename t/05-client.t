@@ -303,7 +303,7 @@ subtest 'reads are not filtered by owner unless you ask them to be' => sub {
 };
 
 subtest 'a write renders immediately and is recorded where a query will find it' => sub {
-    plan tests => 6;
+    plan tests => 8;
 
     wipe();
     $drain->();
@@ -325,7 +325,13 @@ subtest 'a write renders immediately and is recorded where a query will find it'
     ok($entry, 'the mutation was recorded in the journal');
     is($entry->{PROXMOD_CRON_JOB}, 'acme-nightly',
         'under the same field the run records use, so the two interleave');
-    is($entry->{PROXMOD_CRON_USER}, 'acme-backup', 'attributed to the extension that made it');
+    is($entry->{PROXMOD_CRON_ACTOR}, 'acme-backup', 'attributed to the extension that made it');
+    is($entry->{PROXMOD_CRON_VIA}, 'client', 'through the surface it came in on');
+    # Not a PVE user, so not in the field that means one. `journalctl
+    # PROXMOD_CRON_USER=root@pam` has to return that person's changes and not an
+    # extension's, which it cannot do if an extension id is ever written here.
+    ok(!exists $entry->{PROXMOD_CRON_USER},
+        'and PROXMOD_CRON_USER is absent, because an extension is not a user');
     like($entry->{MESSAGE}, qr/create node job 'acme-nightly' by acme-backup via client/,
         'and the message says what happened, to what, by whom, through which surface');
 };

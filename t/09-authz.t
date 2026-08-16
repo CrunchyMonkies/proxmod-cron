@@ -60,7 +60,7 @@ $Proxmod::Log::FH = $null;
 # per audit record.
 my $drain = ProxmodCronTest::journal_sink();
 
-plan tests => 8;
+plan tests => 9;
 
 # ---------------------------------------------------------------------------
 
@@ -454,6 +454,44 @@ subtest 'the can_* flags on a row match the write methods, origin by privilege' 
             }
         }
     }
+};
+
+subtest 'a change through the API is attributed to the PVE user who made it' => sub {
+    plan tests => 8;
+
+    setup();
+    login('admin');
+    ProxmodCronTest::call($NODE, 'create_job',
+        { node => $NODENAME, id => 'made', %{ cmd_job() }, schedule => '@daily' });
+
+    my ($change) = grep { ($_->{PROXMOD_CRON_EVENT} || '') eq 'change' } @{ $drain->() };
+
+    ok($change, 'the mutation was recorded');
+    is($change->{PROXMOD_CRON_ACTOR}, 'admin@pve', 'the actor is the caller');
+    is($change->{PROXMOD_CRON_VIA}, 'api', 'through the API');
+    # Here — and only where the actor really is a person — the two agree. That
+    # is what makes `journalctl PROXMOD_CRON_USER=admin@pve` mean what it says,
+    # and it is why ProxmodCron::Client leaves the field unset entirely.
+    is($change->{PROXMOD_CRON_USER}, 'admin@pve', 'and it is a PVE user, so USER is set too');
+
+    # §8.6 records the attempts, not only the changes. A refusal with no
+    # attribution would be the least useful line in an incident. Refused on the
+    # origin rule rather than on a privilege, because a caller the declarative
+    # gate turns away never reaches any code of ours to record anything.
+    setup();
+    seed('node', 'theirs', cmd_job(), origin => 'extension', owner => 'acme-backup');
+    $drain->();
+
+    login('admin');
+    ProxmodCronTest::refused($NODE, 'update_job',
+        { node => $NODENAME, id => 'theirs', schedule => '@hourly' });
+
+    my ($refused) = grep { ($_->{PROXMOD_CRON_EVENT} || '') eq 'change' } @{ $drain->() };
+
+    ok($refused, 'so was the refusal');
+    is($refused->{PROXMOD_CRON_ACTOR}, 'admin@pve', 'naming who was refused');
+    is($refused->{PROXMOD_CRON_USER}, 'admin@pve', 'in both fields, as a user');
+    like($refused->{MESSAGE}, qr/outcome=refused/, 'and saying that it was');
 };
 
 subtest 'run metadata is Sys.Audit; run output is Sys.Syslog, or delegation' => sub {

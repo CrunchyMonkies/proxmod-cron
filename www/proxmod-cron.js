@@ -1120,6 +1120,18 @@
             var html = [];
 
             Ext.each(lines, function (line) {
+                // The wrapper numbers every line it sent; a hole means journald
+                // dropped what was between, usually to its own rate limit. Shown
+                // as a rule, because the alternative is a log that silently
+                // reads as shorter than the run actually was.
+                if (line.gap) {
+                    html.push('<div class="proxmod-cron-log-gap">'
+                        + enc(Ext.String.format(
+                            gettext('{0} lines missing from the journal'),
+                            line.gap))
+                        + '</div>');
+                }
+
                 var cls = line.stream === 'stderr'
                     ? 'proxmod-cron-log-err' : 'proxmod-cron-log-out';
                 // The most attacker-influenced text in the extension: arbitrary
@@ -2163,7 +2175,7 @@
 
             me.store = Ext.create('Ext.data.Store', {
                 fields: ['time', 'priority', 'event', 'job', 'scope', 'run',
-                    'user', 'message'],
+                    'actor', 'via', 'user', 'message'],
                 data: [],
             });
 
@@ -2226,10 +2238,19 @@
                     renderer: function (v) { return enc(v); },
                 },
                 {
-                    header: gettext('User'),
-                    dataIndex: 'user',
+                    // Actor, not user: a change an extension made has no PVE
+                    // user, and binding this to `user` left the column blank
+                    // for every one of them.
+                    header: gettext('Actor'),
+                    dataIndex: 'actor',
                     width: 140,
-                    renderer: function (v) { return enc(v); },
+                    renderer: function (value, meta, record) {
+                        var via = record.data.via;
+                        if (via) {
+                            meta.tdAttr = qtip(enc(gettext('via') + ' ' + via));
+                        }
+                        return enc(value);
+                    },
                 },
                 {
                     header: gettext('Message'),
@@ -2406,6 +2427,8 @@
         '    white-space: pre-wrap; word-break: break-all; }',
         '.proxmod-cron-log-err { color: #FF6C59; }',
         '.proxmod-cron-log-out { }',
+        '.proxmod-cron-log-gap { color: #F0AD4E; text-align: center;',
+        '    border-top: 1px dashed currentColor; margin: 4px 0; }',
     ].join('\n'));
 
     // -----------------------------------------------------------------------

@@ -36,7 +36,7 @@ use ProxmodCron::Sync;
 # to install is that it only ever writes the two files it generates, and the
 # last subtest is the one that pins that.
 
-plan tests => 9;
+plan tests => 10;
 
 ProxmodCron::Registry::register('ProxmodCron::JobType::Command');
 
@@ -242,6 +242,28 @@ subtest 'our own generated file is attributed to us' => sub {
 
     is(scalar(@{ matching(qr/fstrim/, [grep { $_->{owner} eq 'system' } @$entries]) }), 0,
         'and nothing of ours is attributed to the system');
+};
+
+subtest 'the anchor is ours too, and says what it is' => sub {
+    plan tests => 4;
+
+    # The shipped conffile itself, not a stand-in: it is the file the inventory
+    # will meet on a real host.
+    File::Copy::copy("$FindBin::Bin/../cron/proxmod-cron",
+        ProxmodCron::Render::anchor_path())
+        or die "cannot install the anchor fixture: $!\n";
+
+    my $anchor = one(qr/proxmod-cron-sync/, ProxmodCron::Inventory::collect());
+
+    ok($anchor, 'the anchor line is listed like any other cron entry');
+    # It is the one file in /etc/cron.d that is unambiguously this package's,
+    # and reporting it as somebody else's was exactly backwards.
+    is($anchor->{owner}, 'proxmod-cron', 'attributed to us');
+    is($anchor->{schedule}, '* * * * *', 'with the schedule it actually runs on');
+    # A root line running every minute with no schedule anyone chose is worth
+    # explaining in place, rather than leaving an administrator to work out
+    # whether they can remove it.
+    like($anchor->{note}, qr/anchor/, 'and a note saying it is not a scheduled job');
 };
 
 subtest 'nothing that cannot be turned into a path is opened' => sub {

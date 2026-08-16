@@ -178,9 +178,9 @@ journalctl MESSAGE_ID=<finish> --since -30d            # every completion
 ```
 
 Fields: `PROXMOD_CRON_JOB`, `_SCOPE`, `_TYPE`, `_RUN`, `_EVENT`
-(`start`/`output`/`finish`/`skipped`/`change`), `_STREAM`, `_EXIT`, `_SIGNAL`,
-`_DURATION_MS`, `_STARTED`, `_USER`, `_NOTICE`, plus `PRIORITY` and a
-per-event-class `MESSAGE_ID`.
+(`start`/`output`/`finish`/`skipped`/`change`), `_STREAM`, `_SEQ`, `_EXIT`,
+`_SIGNAL`, `_DURATION_MS`, `_STARTED`, `_ACTOR`, `_VIA`, `_USER`, `_NOTICE`,
+plus `PRIORITY` and a per-event-class `MESSAGE_ID`.
 
 `_TYPE` is carried on the rendered cron line rather than looked up when the job
 runs, so it always names the definition that produced the argv beside it.
@@ -189,13 +189,30 @@ and the finish record — journald's receive timestamp is a different reading of
 the same instant, and `reindex` must rebuild the same numbers the wrapper wrote.
 `_NOTICE` marks a line this extension emitted rather than the job (currently only
 `truncated`), which is how the output tail stays what the job actually said.
+`_SEQ` numbers every entry a run sent, so a hole in it is journald having dropped
+something — the log view says how many lines are missing instead of quietly
+showing a shorter run.
+
+Attribution on a `change` record is three fields, not one. `_ACTOR` is always who
+made the change; `_VIA` is the surface they came through (`api`, `client`, `cli`,
+`store`); and `_USER` is set **only when the actor is genuinely a PVE user**. So
+`journalctl PROXMOD_CRON_USER=root@pam` returns that person's changes and nothing
+else, and `journalctl PROXMOD_CRON_VIA=client` returns everything extensions did.
 
 Because management actions are journalled with the same `PROXMOD_CRON_JOB` field,
 one query answers the question that actually gets asked during an incident:
 **who last changed this job, and how has it run since?**
 
-Three properties worth knowing:
+Four properties worth knowing:
 
+- **Order within a stream is exact; order between the two is not.** stdout and
+  stderr arrive on separate pipes, and when both already hold data there is
+  nothing anywhere that records which the job wrote first. Usually the ordering
+  is gone before the wrapper sees it at all: a C program's stdout is
+  block-buffered to a pipe while its stderr is not, so the stderr arrives at
+  once and the stdout arrives in blocks at exit. A job whose interleaving
+  matters should write to one stream, or be run under `stdbuf -oL`. Every line
+  is tagged with the stream it came from either way.
 - **journald is the store of record.** `/var/lib/proxmod/cron/last-run.json` is
   a derived cache for the grid's status column. Delete it and nothing is lost but
   a `proxmod-cronctl reindex`.

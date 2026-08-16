@@ -30,7 +30,7 @@ use ProxmodCron::Runs;
 # that list is built from a request parameter and none of it may go near a
 # shell.
 
-plan tests => 11;
+plan tests => 12;
 
 my $EPOCH = 1_739_000_000;
 
@@ -338,6 +338,46 @@ subtest 'output paginates by cursor, with no gaps and no repeats' => sub {
     is($second->{done}, 1, 'and says so');
 
     is($first->{lines}[0]{stream}, 'stdout', 'each line carries the stream it came from');
+};
+
+subtest 'a hole in the sequence is reported, not smoothed over' => sub {
+    plan tests => 5;
+
+    my $run = '1739000000000-dddddddd';
+
+    # The wrapper sent six numbered entries and journald kept four: this is what
+    # its rate limiter leaves behind. Nothing in the surviving entries says so,
+    # which is the point — without the sequence the run simply reads as a run
+    # that printed four lines.
+    my @entries = map {
+        entry(
+            at => $_,
+            cursor => "s=1;i=$_",
+            PROXMOD_CRON_EVENT => 'output',
+            PROXMOD_CRON_RUN => $run,
+            PROXMOD_CRON_JOB => 'nightly-trim',
+            PROXMOD_CRON_STREAM => 'stdout',
+            PROXMOD_CRON_SEQ => $_,
+            MESSAGE => "line $_",
+        );
+    } (1, 2, 5, 6);
+
+    ProxmodCronTest::journal_runner(\@entries);
+
+    my $page = ProxmodCron::Runs::output($run);
+
+    is($page->{lines}[0]{seq}, 1, 'each line carries the number the wrapper gave it');
+    is($page->{lines}[2]{gap}, 2, 'and the line after the hole says how many went missing');
+    is_deeply([map { $_->{gap} } @{ $page->{lines} }], [undef, undef, 2, undef],
+        'while a line that follows its predecessor is left alone');
+
+    # The query is `-n <limit>`, so the newest page of a long run begins part way
+    # through the sequence by design. Treating that as a hole would put a false
+    # 'lines missing' rule at the top of every long log.
+    my $tail = ProxmodCron::Runs::output($run, limit => 2);
+
+    is($tail->{lines}[0]{seq}, 5, 'a page that starts mid-run starts where it starts');
+    ok(!defined $tail->{lines}[0]{gap}, 'and nothing before its first line is called missing');
 };
 
 subtest 'output is sanitised before it ever reaches a browser' => sub {

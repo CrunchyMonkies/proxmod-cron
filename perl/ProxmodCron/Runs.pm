@@ -112,7 +112,10 @@ Pagination is by cursor, not by offset. A live tail polls this while the run is
 still going, and an offset would skip or repeat lines as new ones arrive between
 polls.
 
-Returns C<< { lines => [...], cursor => $last, done => 0|1 } >>.
+Returns C<< { lines => [...], cursor => $last, done => 0|1 } >>. Each line
+carries its C<seq>, and a line the journal lost entries in front of carries
+C<gap>, the number missing. Entries dropped after the last surviving one cannot
+be detected this way and are not reported.
 
 =cut
 
@@ -138,8 +141,11 @@ sub output {
 
     my @lines;
     my $last_cursor;
+    my $prev_seq;
 
     for my $entry (@$entries) {
+        my $seq = _int(_field($entry, 'PROXMOD_CRON_SEQ'));
+
         my $line = {
             stream => _field($entry, 'PROXMOD_CRON_STREAM') || 'stdout',
             priority => _field($entry, 'PRIORITY'),
@@ -152,6 +158,24 @@ sub output {
         # the status cache's tail leaves them out.
         my $notice = _field($entry, 'PROXMOD_CRON_NOTICE');
         $line->{notice} = $notice if defined $notice;
+
+        # The wrapper numbers every entry it sends, densely. A jump means
+        # journald dropped what was between — rate limiting, most likely — and
+        # saying so is the whole point: a run that lost its middle otherwise
+        # comes back looking like a shorter run.
+        #
+        # Between two returned lines only, never before the first. The query is
+        # `-n <limit>`, so the first page of a long run legitimately starts part
+        # way through the sequence, and calling that a gap would put a false
+        # 'lines missing' rule at the top of every long log.
+        $line->{seq} = $seq if defined $seq;
+        $line->{gap} = $seq - $prev_seq - 1
+            if defined $seq && defined $prev_seq && $seq > $prev_seq + 1;
+
+        # Unconditional, undef included: a run recorded before this field
+        # existed has no sequence at all, and carrying the last seen number
+        # across the hole would invent a gap out of nothing.
+        $prev_seq = $seq;
 
         push @lines, $line;
         $last_cursor = $entry->{__CURSOR} if defined $entry->{__CURSOR};
@@ -200,6 +224,11 @@ sub journal {
             job => _field($entry, 'PROXMOD_CRON_JOB'),
             scope => _field($entry, 'PROXMOD_CRON_SCOPE'),
             run => _field($entry, 'PROXMOD_CRON_RUN'),
+            # actor is who, via is what kind. user is set only when the actor
+            # really is a PVE user, so it is absent on everything an extension
+            # did — which is why the Log tab shows actor and not user.
+            actor => _field($entry, 'PROXMOD_CRON_ACTOR'),
+            via => _field($entry, 'PROXMOD_CRON_VIA'),
             user => _field($entry, 'PROXMOD_CRON_USER'),
             message => _sanitise(_field($entry, 'MESSAGE')),
         };

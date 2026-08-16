@@ -33,7 +33,7 @@ use ProxmodCron::State;
 # PROXMOD_CRON_TEST_SOCKET, honoured only for a non-root process — because a
 # package variable does not cross a fork+exec.
 
-plan tests => 11;
+plan tests => 12;
 
 my $EXEC = "$FindBin::Bin/../exec/proxmod-cron-exec";
 my $PERL_DIR = "$FindBin::Bin/../perl";
@@ -253,6 +253,41 @@ subtest 'a job printing far past the cap still finishes' => sub {
     is($finish->{PROXMOD_CRON_EXIT}, '0', 'and the exit status is untouched by any of it');
 
     limits();
+};
+
+subtest 'every entry the wrapper sends is numbered, so a lost one shows' => sub {
+    plan tests => 5;
+
+    limits(max_lines => 5);
+
+    my $result = run_exec(['node', 'numbered', '--',
+        perl_job(q{ $| = 1; print "line $_\n" for 1 .. 20; exit(0) })]);
+
+    my $output = events($result, 'output');
+    my @seq = map { $_->{PROXMOD_CRON_SEQ} } @$output;
+
+    is($seq[0], '1', 'the numbering starts at one');
+    # Dense over everything that left the process, notice included. That is the
+    # whole property: journald rate-limits per service and drops entries, and a
+    # hole in a dense sequence is the only evidence the reader has that a run
+    # came back shorter than it ran.
+    is_deeply(\@seq, [map { "$_" } 1 .. 6], 'and runs unbroken to the last entry');
+
+    my ($notice) = grep { $_->{MESSAGE} =~ /output truncated/ } @$output;
+    is($notice->{PROXMOD_CRON_SEQ}, '6',
+        'the truncation notice is numbered like any other entry, not skipped');
+
+    limits();
+    wipe_state();
+
+    my $quiet = run_exec(['node', 'unnumbered', '--no-output', '--',
+        perl_job(q{ $| = 1; print "secret\n" for 1 .. 5; exit(0) })]);
+
+    is(scalar(@{ events($quiet, 'output') }), 0, 'a run that journals nothing it printed');
+    # Nothing was sent, so there is nothing to number, and a start or finish
+    # record carrying a stray sequence would suggest output that never existed.
+    is(scalar(grep { exists $_->{PROXMOD_CRON_SEQ} } @{ $quiet->{entries} }), 0,
+        'has no sequence on any of its records');
 };
 
 subtest 'a line with no end is cut rather than buffered forever' => sub {

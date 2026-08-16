@@ -554,6 +554,10 @@ sub cmd_log {
 
         for my $line (@{ $page->{lines} }) {
             $seen++;
+            # Said out loud rather than silently skipped. Without it a run
+            # journald rate-limited reads as a run that printed less.
+            printf("--- %d line%s missing from the journal ---\n",
+                $line->{gap}, ($line->{gap} == 1 ? '' : 's')) if $line->{gap};
             my $mark = ($line->{stream} || '') eq 'stderr' ? 'E' : ' ';
             print "$mark $line->{text}\n";
         }
@@ -697,7 +701,7 @@ sub cmd_doctor {
     push @errors, "a job type plugin failed to load: $_" for @PLUGIN_ERRORS;
 
     # 1. Can anything run at all.
-    my $anchor = ProxmodCron::Config::cron_d() . '/proxmod-cron';
+    my $anchor = ProxmodCron::Render::anchor_path();
     push @errors, "the anchor $anchor is missing: nothing will be rendered or run"
         if !-f $anchor;
 

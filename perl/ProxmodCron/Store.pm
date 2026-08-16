@@ -439,6 +439,10 @@ breaking proxmod-verify or giving up the indexed query.
 Never a ticket, password, token or key in either — the journal is readable by
 anyone with Sys.Syslog or shell access, which is more people than the API is.
 
+Attribution is three fields: PROXMOD_CRON_ACTOR is always who did it,
+PROXMOD_CRON_VIA is the surface they came through, and PROXMOD_CRON_USER is set
+only when the actor is genuinely a PVE user.
+
 =cut
 
 sub audit {
@@ -453,6 +457,15 @@ sub _audit {
 
     my $who = $audit->{user} || $audit->{owner} || 'root';
     my $via = $audit->{via} || 'store';
+
+    # PROXMOD_CRON_USER is the PVE user, and only ever that. An extension acting
+    # through ProxmodCron::Client is not one, and journalling its id here would
+    # make `journalctl PROXMOD_CRON_USER=root@pam` — the query the field exists
+    # for — return rows that answer a different question. So who-did-it lives in
+    # PROXMOD_CRON_ACTOR, which is always set, and PROXMOD_CRON_VIA says what
+    # kind of actor it is: `journalctl PROXMOD_CRON_VIA=client` is every change
+    # extensions made, and USER is absent on all of them.
+    my $is_pve_user = ($via eq 'api' && $audit->{user}) ? 1 : 0;
 
     my @parts = ("$action $scope job '$id' by $who via $via");
 
@@ -479,7 +492,9 @@ sub _audit {
             id => $id, scope => $scope, type => ($job ? $job->{type} : undef),
         }) },
         PROXMOD_CRON_EVENT => 'change',
-        PROXMOD_CRON_USER => $who,
+        PROXMOD_CRON_ACTOR => $who,
+        PROXMOD_CRON_VIA => $via,
+        ($is_pve_user ? (PROXMOD_CRON_USER => $who) : ()),
         MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{change},
         PRIORITY => ($audit->{outcome} && $audit->{outcome} eq 'refused') ? 4 : 5,
         MESSAGE => $message,

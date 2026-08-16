@@ -43,6 +43,15 @@ my $MAX_LINE_BYTES = 16 * 1024;
 
 my $READ_CHUNK = 65_536;
 
+# Position in this run's output, on every entry we send. A process runs exactly
+# one job, so a script-level counter is the whole of it.
+#
+# Not for ordering — for absence. journald rate-limits per service, so entries
+# can be dropped, and until this existed a run whose middle went missing came
+# back as a shorter run with nothing to say so. A hole in the sequence is what
+# lets the reader say "12 lines missing" instead of quietly showing 988 of 1000.
+my $SEQ = 0;
+
 exit(main(@ARGV));
 
 sub main {
@@ -330,6 +339,23 @@ sub run_unwatched {
     return $?;
 }
 
+# Forward what the two pipes produce, in the order the kernel reports it.
+#
+# When only one pipe is ready, select has told us which stream arrived first and
+# the recorded order is exact. When both are ready — a job that finished before
+# we were scheduled, a burst — there is no information anywhere about their
+# relative order, and this drains stdout first because that is the order
+# IO::Select returns handles in.
+#
+# Do not "fix" that by alternating a line from each buffer. It would straighten
+# out `echo a; echo b >&2` repeated and would scramble `echo 1; echo 2; echo 3
+# >&2`, because it invents an ordering rather than reporting one. The ambiguity
+# is real and it is documented; a plausible-looking guess would hide it.
+#
+# The order is usually destroyed before we ever see it in any case: glibc
+# block-buffers stdout to a pipe and leaves stderr unbuffered, so a C program's
+# stderr arrives immediately and its stdout arrives in blocks at exit. Nothing
+# on this side of the pipe can recover that.
 sub pump {
     my ($job, $run, $out_r, $err_r, $keep_output) = @_;
 
@@ -424,6 +450,10 @@ sub emit {
                 PROXMOD_CRON_EVENT => 'output',
                 PROXMOD_CRON_RUN => $run,
                 PROXMOD_CRON_STREAM => $stream,
+                # Numbered like any other entry we send: the sequence is dense
+                # over what left this process, so a gap in it means the journal
+                # lost something and nothing else.
+                PROXMOD_CRON_SEQ => ++$SEQ,
                 # Tagged because it is ours, not the job's. The log view shows it
                 # like any other line; the output tail leaves it out, which is
                 # what keeps a rebuilt tail identical to the one below.
@@ -448,6 +478,7 @@ sub emit {
         PROXMOD_CRON_EVENT => 'output',
         PROXMOD_CRON_RUN => $run,
         PROXMOD_CRON_STREAM => $stream,
+        PROXMOD_CRON_SEQ => ++$SEQ,
         PRIORITY => ($stream eq 'stderr' ? 4 : 6),
         MESSAGE => $line,
     });

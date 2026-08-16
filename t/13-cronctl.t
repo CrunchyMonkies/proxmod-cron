@@ -315,7 +315,7 @@ subtest 'run puts a manual run through the same wrapper cron uses' => sub {
 };
 
 subtest 'runs and log read history back out of journald' => sub {
-    plan tests => 9;
+    plan tests => 10;
 
     wipe();
     store('node', { 'nightly-trim' => $COMMAND_JOB });
@@ -330,9 +330,11 @@ subtest 'runs and log read history back out of journald' => sub {
         entry(1739000000, 'start', run => $first),
         entry(1739000005, 'finish', run => $first, exit => 0, duration => 5000, lines => 0),
         entry(1739000100, 'start', run => $second),
-        entry(1739000101, 'output', run => $second, stream => 'stdout', message => 'working'),
-        entry(1739000102, 'output', run => $second, stream => 'stderr', message => 'trouble'),
-        entry(1739000110, 'finish', run => $second, exit => 3, duration => 10000, lines => 2),
+        entry(1739000101, 'output', run => $second, stream => 'stdout', message => 'working', seq => 1),
+        # Sequence 2 and 3 are not here: this is a run journald rate-limited,
+        # which is the ordinary way a fixture like this one arises in production.
+        entry(1739000102, 'output', run => $second, stream => 'stderr', message => 'trouble', seq => 4),
+        entry(1739000110, 'finish', run => $second, exit => 3, duration => 10000, lines => 4),
     );
 
     my $argv_log = ProxmodCronTest::journalctl_stub(\@entries);
@@ -352,6 +354,11 @@ subtest 'runs and log read history back out of journald' => sub {
     my $log = ctl('log', $second);
     like($log->{out}, qr/^  working$/m, 'stdout lines are plain');
     like($log->{out}, qr/^E trouble$/m, 'stderr lines are marked');
+    # Said out loud between the two lines it happened between. Printing 'working'
+    # and 'trouble' with nothing between them would show a two-line run, which is
+    # not what ran.
+    like($log->{out}, qr/^--- 2 lines missing from the journal ---$/m,
+        'and what the journal dropped is reported rather than quietly skipped');
 
     my $gone = ctl('log', '1739999999999-deadbeef');
     like($gone->{out}, qr/no longer in the journal/,
@@ -502,6 +509,7 @@ sub entry {
     );
 
     $fields{PROXMOD_CRON_STREAM} = $opt{stream} if defined $opt{stream};
+    $fields{PROXMOD_CRON_SEQ} = $opt{seq} if defined $opt{seq};
     $fields{PROXMOD_CRON_EXIT} = $opt{exit} if defined $opt{exit};
     $fields{PROXMOD_CRON_SIGNAL} = 0 if defined $opt{exit};
     $fields{PROXMOD_CRON_DURATION_MS} = $opt{duration} if defined $opt{duration};

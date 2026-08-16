@@ -194,6 +194,12 @@ Ownership comes from `$api->id`, never from an argument — which is why this is
 object rather than a set of class methods. If the owner were a parameter, one
 extension could claim another's jobs or forge `origin: user`.
 
+Every write you make is journalled as a `change` record carrying
+`PROXMOD_CRON_ACTOR=<your extension id>` and `PROXMOD_CRON_VIA=client`. It does
+**not** set `PROXMOD_CRON_USER`: your extension is not a PVE user, and a query
+for a person's changes must not return yours. `journalctl
+PROXMOD_CRON_ACTOR=acme-backup` is how an administrator sees what you did.
+
 | Method | |
 |---|---|
 | `new($api)` | `$api` is your `Proxmod::API`; outside a daemon, a plain extension id |
