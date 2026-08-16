@@ -5,10 +5,15 @@ name: release
 # release should never depend on a workflow whose trigger (push to main) may or
 # may not have run for the exact commit being tagged.
 
+# Two tag shapes, one meaning. Releases are tagged with the bare CalVer the
+# changelog carries (202608.17.0); the "v" form is accepted too so an older tag
+# convention, or a habit, still reaches this workflow rather than silently
+# doing nothing.
 on:
   push:
     tags:
       - "v*.*.*"
+      - "[0-9]*.*.*"
 
 permissions:
   contents: write
@@ -39,7 +44,7 @@ jobs:
           tag_version="${GITHUB_REF_NAME#v}"
           pkg_version=$(dpkg-parsechangelog -S Version)
           if [ "$tag_version" != "$pkg_version" ]; then
-            echo "tag v$tag_version does not match debian/changelog version $pkg_version" >&2
+            echo "tag $GITHUB_REF_NAME does not match debian/changelog version $pkg_version" >&2
             exit 1
           fi
 

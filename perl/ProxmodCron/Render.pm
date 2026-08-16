@@ -20,7 +20,7 @@ use ProxmodCron::Spec;
 #     An unescaped one silently truncates the job. It is escaped after quoting,
 #     because cron reads the line before the shell does.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 our $EXEC = ProxmodCron::Config::prefix() . '/usr/lib/proxmod-cron/proxmod-cron-exec';
 

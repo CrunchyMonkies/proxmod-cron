@@ -20,7 +20,7 @@ use ProxmodCron::Spec;
 # cluster may write a field this one does not know about, and dropping the whole
 # file over it would stop this node's jobs from rendering.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 # Test override, guarded the same way proxmod's own does it: honoured only when
 # the process is not root, so it can never be used to redirect a production

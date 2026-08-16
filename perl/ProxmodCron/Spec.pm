@@ -16,7 +16,7 @@ use POSIX qw(mktime);
 # It is also one of the modules that must load with NO PVE modules present:
 # proxmod-cron-sync calls it from cron, outside any daemon. Core Perl only.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 # Nicknames cron itself understands. @reboot has no schedule at all, which is
 # why next_run can return undef and every caller has to cope with that.

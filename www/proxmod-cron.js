@@ -35,7 +35,7 @@
     }
 
     var EXT = 'cron';
-    var VERSION = '0.1.0';
+    var VERSION = '202608.17.0';
 
     // PVE's own, always present in the workspace. The fallback is for the
     // moment before the translation table is built, not for a page without it.

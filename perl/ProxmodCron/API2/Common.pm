@@ -31,7 +31,7 @@ use ProxmodCron::Store;
 # This module DOES load PVE. It is reached only from inside pvedaemon/pveproxy;
 # nothing under exec/ may use it.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 my %ACTION_FLAG = (
     create => 'can_create',

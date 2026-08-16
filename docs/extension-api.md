@@ -26,7 +26,7 @@ proxmod-cron sits at `order: 40`, below the default 50, so an extension at 50
 that requires it loads after it. In `debian/control`:
 
 ```
-Depends: proxmod (>= 0.2.0), proxmod-cron (>= 0.1.0)
+Depends: proxmod (>= 0.2.0), proxmod-cron (>= 202608.17.0)
 ```
 
 ---
@@ -458,7 +458,7 @@ panel. **`renderCommand`'s return value is HTML-encoded before it is displayed**
 ### The rest of the namespace
 
 ```js
-ProxmodCron.version                                  // '0.1.0'
+ProxmodCron.version                                  // '202608.17.0'
 
 ProxmodCron.api.list(scope, opts)                    // scope: 'cluster' | 'node'
 ProxmodCron.api.get(scope, id, opts)

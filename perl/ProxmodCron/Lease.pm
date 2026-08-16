@@ -39,7 +39,7 @@ use ProxmodCron::Config;
 #
 # No PVE here either: the wrapper calls this from cron.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 # Tick directories kept per job. Enough to answer "where did it run, and the
 # time before that" and few enough that a per-minute job does not accumulate

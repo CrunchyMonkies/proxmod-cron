@@ -57,7 +57,7 @@ use ProxmodCron::State;
 # Standalone by design: this loads no proxmod and no PVE. Disabling proxmod
 # stops management, not execution and not tracking.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 # Defaults; overridable per node via max_lines / max_line_bytes in
 # /etc/proxmod/cron.cfg.

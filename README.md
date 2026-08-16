@@ -67,7 +67,7 @@ would be undone by that package's next upgrade.
 ## Installing
 
 ```sh
-apt install ./proxmod-cron_0.1.0_all.deb
+apt install ./proxmod-cron_202608.17.0_all.deb
 proxmod-verify          # exits 0 and lists 'cron' as loaded
 ```
 

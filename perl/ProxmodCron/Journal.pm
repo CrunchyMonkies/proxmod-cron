@@ -27,7 +27,7 @@ use Socket qw(AF_UNIX SOCK_DGRAM);
 # proxmod-cron-exec from cron with no PVE in scope, and it must compile under -T
 # for both.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 # Overridable so the tests can point at a socket in a temp directory. The
 # environment override exists because proxmod-cron-exec is exercised as a real

@@ -33,7 +33,7 @@ use ProxmodCron::Sync;
 #   unprotected history method would return an empty list that reads as "this
 #   job has never run" rather than as a permissions problem.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 my $SCOPE = 'node';
 

@@ -25,7 +25,7 @@ use ProxmodCron::Sync;
 # PVE::Jobs has to PVE::API2::Cluster::Jobs. A caller acting on behalf of a user
 # checks first.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 # Set by ProxmodCron.pm when it is running inside a daemon that has PVE::Cluster
 # available. Takes ($code) and runs it under a cluster-wide lock. When unset the

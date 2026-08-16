@@ -28,7 +28,7 @@ use ProxmodCron::Sync;
 # about which node ran what. The grid's status column comes from each node's own
 # `jobs/{id}/status`, and the UI links to the owning node's Runs tab.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 my $SCOPE = 'cluster';
 

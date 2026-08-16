@@ -24,7 +24,7 @@ use ProxmodCron::Sync;
 # instead, but a failure *here* has no such capture, so it should reach root the
 # ordinary way.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 my $verbose = 0;
 my $dry_run = 0;

@@ -14,7 +14,7 @@ use warnings;
 #
 # Loads without PVE — proxmod-cron-sync calls build_command() from cron.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 =head2 type()
 

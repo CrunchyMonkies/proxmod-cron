@@ -28,7 +28,7 @@ use ProxmodCron::Sync;
 # otherwise correct extension, which is why it is said here, in the first
 # paragraph of the client section of docs/extension-api.md, and nowhere quietly.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 =head2 new($api)
 

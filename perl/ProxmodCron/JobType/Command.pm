@@ -15,7 +15,7 @@ use ProxmodCron::Registry;
 # be created by someone holding Sys.Modify on the scope. There is no ACL path
 # that honestly describes "runs anything as root", so we do not invent one.
 
-our $VERSION = '0.1.0';
+our $VERSION = '202608.17.0';
 
 sub type { 'command' }
 
