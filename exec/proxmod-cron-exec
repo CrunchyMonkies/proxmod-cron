@@ -1,0 +1,432 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Fcntl qw(LOCK_EX LOCK_NB);
+use IO::Select ();
+use POSIX ();
+use Time::HiRes ();
+
+use ProxmodCron::Config;
+use ProxmodCron::Journal;
+use ProxmodCron::State;
+
+# The run wrapper. Every job with track: true renders through it, and it is the
+# only thing that writes run records.
+#
+#   proxmod-cron-exec <scope> <jobid> [--no-output] -- <argv...>
+#
+# Four properties that are easy to get wrong, all of them here:
+#
+#   * It NEVER STOPS DRAINING THE PIPES. Once the line cap is reached it stops
+#     forwarding but keeps reading, because a full pipe blocks the child
+#     forever. A capped run must still finish.
+#   * It never alters what the job returned. A child killed by a signal makes
+#     this process die of the same signal, so cron's view of success matches
+#     reality instead of seeing a clean exit 0.
+#   * A logging failure is not a job failure. ProxmodCron::Journal always
+#     succeeds; nothing here turns a working backup into a failed one because a
+#     socket was missing.
+#   * The start record is emitted before the fork, so a job that dies instantly
+#     still leaves a trace.
+#
+# Standalone by design: this loads no proxmod and no PVE. Disabling proxmod
+# stops management, not execution and not tracking.
+
+our $VERSION = '0.1.0';
+
+# Defaults; overridable per node via max_lines / max_line_bytes in
+# /etc/proxmod/cron.cfg.
+my $MAX_LINES = 10_000;
+my $MAX_LINE_BYTES = 16 * 1024;
+
+my $READ_CHUNK = 65_536;
+
+exit(main(@ARGV));
+
+sub main {
+    my @args = @_;
+
+    my ($scope, $id, $keep_output, $argv) = parse_args(@args);
+
+    my $job = {
+        id => $id,
+        scope => $scope,
+        # The type is not passed on the command line: it would be one more thing
+        # in /etc/cron.d to keep in step with the store for no gain, and the
+        # journal record does not need it to be queryable by job.
+    };
+
+    load_limits();
+
+    my ($lock, $busy) = take_lock($scope, $id);
+    if ($busy) {
+        # A slow job must not stack up. A recorded skip is far better than a
+        # silent one: "it did not run" and "it ran and did nothing" look
+        # identical afterwards otherwise.
+        ProxmodCron::Journal::send_entry({
+            %{ ProxmodCron::Journal::job_fields($job) },
+            MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{skipped},
+            PROXMOD_CRON_EVENT => 'skipped',
+            PRIORITY => 4,
+            MESSAGE => "skipped $scope job '$id': a previous run is still in progress",
+        });
+        return 0;
+    }
+
+    my $run = run_id();
+    my $started = Time::HiRes::time();
+
+    ProxmodCron::Journal::send_entry({
+        %{ ProxmodCron::Journal::job_fields($job) },
+        MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{start},
+        PROXMOD_CRON_EVENT => 'start',
+        PROXMOD_CRON_RUN => $run,
+        MESSAGE => "started $scope job '$id': " . join(' ', @$argv),
+    });
+
+    my ($status, $captured) = supervise($job, $run, $argv, $keep_output);
+
+    my $duration_ms = int((Time::HiRes::time() - $started) * 1000);
+
+    my $exit = $status >> 8;
+    my $signal = $status & 127;
+
+    ProxmodCron::Journal::send_entry({
+        %{ ProxmodCron::Journal::job_fields($job) },
+        MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{finish},
+        PROXMOD_CRON_EVENT => 'finish',
+        PROXMOD_CRON_RUN => $run,
+        PROXMOD_CRON_EXIT => $exit,
+        PROXMOD_CRON_SIGNAL => $signal,
+        PROXMOD_CRON_DURATION_MS => $duration_ms,
+        PROXMOD_CRON_LINES => $captured->{lines},
+        PROXMOD_CRON_TRUNCATED => ($captured->{truncated} ? 1 : 0),
+        PRIORITY => (($exit == 0 && !$signal) ? 6 : 3),
+        MESSAGE => finish_message($scope, $id, $exit, $signal, $duration_ms),
+    });
+
+    ProxmodCron::State::record($scope, $id, {
+        run => $run,
+        started => int($started),
+        finished => int($started) + int($duration_ms / 1000),
+        exit => $exit,
+        signal => $signal,
+        duration_ms => $duration_ms,
+        lines => $captured->{lines},
+        truncated => ($captured->{truncated} ? 1 : 0),
+        state => (($signal) ? 'killed' : ($exit == 0 ? 'ok' : 'failed')),
+        tail => $captured->{tail},
+    });
+
+    # Re-raise rather than exit. cron decides whether a job succeeded from the
+    # wait status, and a SIGKILLed job that exits 0 here would be recorded as a
+    # success by every other tool on the host.
+    if ($signal) {
+        close($lock) if $lock;
+        kill($signal, $$);
+        # Only reached if the signal was somehow ignored.
+        POSIX::_exit(128 + $signal);
+    }
+
+    return $exit;
+}
+
+sub parse_args {
+    my @args = @_;
+
+    my ($scope, $id);
+    my $keep_output = 1;
+    my @argv;
+    my $seen_separator = 0;
+
+    while (@args) {
+        my $arg = shift @args;
+
+        if ($arg eq '--') {
+            $seen_separator = 1;
+            @argv = @args;
+            last;
+        }
+
+        if ($arg eq '--no-output') {
+            $keep_output = 0;
+            next;
+        }
+
+        if (!defined $scope) { $scope = $arg; next }
+        if (!defined $id) { $id = $arg; next }
+
+        usage("unexpected argument '$arg'");
+    }
+
+    usage('missing scope') if !defined $scope;
+    usage('missing job id') if !defined $id;
+    usage("expected '--' before the command") if !$seen_separator;
+    usage('no command given') if !@argv;
+
+    # Untaint both by pattern and rebuild: they reach a lock path, a journal
+    # field and, in the case of the scope, a config lookup.
+    my ($clean_scope) = ($scope =~ /\A(cluster|node)\z/);
+    usage("invalid scope '$scope'") if !defined $clean_scope;
+
+    my ($clean_id) = ($id =~ $ProxmodCron::Config::ID_PATTERN);
+    usage("invalid job id '$id'") if !defined $clean_id;
+
+    return ($clean_scope, $clean_id, $keep_output, \@argv);
+}
+
+sub usage {
+    my ($why) = @_;
+    print STDERR "proxmod-cron-exec: $why\n";
+    print STDERR "usage: proxmod-cron-exec <cluster|node> <jobid> [--no-output]"
+        . " -- <command> [args...]\n";
+    exit(2);
+}
+
+sub load_limits {
+    # The node store, whichever scope the job is in: these are limits on this
+    # node's journald, not properties of the job.
+    my $store = ProxmodCron::Config::load('node');
+
+    $MAX_LINES = $store->{max_lines} if $store->{max_lines};
+    $MAX_LINE_BYTES = $store->{max_line_bytes} if $store->{max_line_bytes};
+
+    return;
+}
+
+# Returns ($handle, $busy). $busy means another run of this job holds the lock;
+# an undef handle with $busy false means we could not lock at all, in which case
+# we still run the job — the lock is overlap protection, not a precondition for
+# doing the work.
+sub take_lock {
+    my ($scope, $id) = @_;
+
+    my $dir = ProxmodCron::Config::state_dir();
+    eval { ProxmodCron::Config::mkdir_p($dir) };
+
+    my $path = ProxmodCron::Config::job_lock_path($scope, $id);
+
+    open(my $fh, '>>', $path) or return (undef, 0);
+
+    return (undef, 1) if !flock($fh, LOCK_EX | LOCK_NB);
+
+    return ($fh, 0);
+}
+
+# Sortable and unique without pulling in a UUID module: milliseconds since the
+# epoch, then four random bytes for the case where two runs of different jobs
+# land in the same millisecond.
+sub run_id {
+    my $ms = int(Time::HiRes::time() * 1000);
+
+    my $hex;
+    if (open(my $fh, '<', '/dev/urandom')) {
+        binmode($fh);
+        my $bytes = '';
+        read($fh, $bytes, 4);
+        close($fh);
+        $hex = unpack('H8', $bytes) if length($bytes) == 4;
+    }
+
+    $hex = sprintf('%04x%04x', $$ & 0xffff, int(rand(0x10000))) if !defined $hex;
+
+    return "$ms-$hex";
+}
+
+sub finish_message {
+    my ($scope, $id, $exit, $signal, $duration_ms) = @_;
+
+    return "$scope job '$id' was killed by signal $signal after ${duration_ms}ms"
+        if $signal;
+
+    return "$scope job '$id' finished in ${duration_ms}ms" if $exit == 0;
+
+    return "$scope job '$id' exited $exit after ${duration_ms}ms";
+}
+
+# Fork the job, forward its output, and wait. Returns (wait status, capture).
+sub supervise {
+    my ($job, $run, $argv, $keep_output) = @_;
+
+    my ($out_r, $out_w, $err_r, $err_w);
+
+    if (!pipe($out_r, $out_w) || !pipe($err_r, $err_w)) {
+        # No pipes means no capture, but the job still has to run.
+        return (run_unwatched($argv), { lines => 0, truncated => 0, tail => [] });
+    }
+
+    my $pid = fork();
+
+    if (!defined $pid) {
+        close($_) for ($out_r, $out_w, $err_r, $err_w);
+        return (run_unwatched($argv), { lines => 0, truncated => 0, tail => [] });
+    }
+
+    if ($pid == 0) {
+        close($out_r);
+        close($err_r);
+
+        open(STDOUT, '>&', $out_w) or POSIX::_exit(127);
+        open(STDERR, '>&', $err_w) or POSIX::_exit(127);
+
+        close($out_w);
+        close($err_w);
+
+        # No shell, ever. The argv arrives as an argv and is executed as one.
+        { exec { $argv->[0] } @$argv; }
+
+        print STDERR "proxmod-cron-exec: cannot execute $argv->[0]: $!\n";
+        POSIX::_exit(127);
+    }
+
+    close($out_w);
+    close($err_w);
+
+    my $captured = pump($job, $run, $out_r, $err_r, $keep_output);
+
+    waitpid($pid, 0);
+
+    return ($?, $captured);
+}
+
+# Last resort when we could not set up the capture: run the job with its output
+# going wherever ours goes. Losing the log is acceptable; not running the job is
+# not.
+sub run_unwatched {
+    my ($argv) = @_;
+
+    my $pid = fork();
+    return 127 << 8 if !defined $pid;
+
+    if ($pid == 0) {
+        { exec { $argv->[0] } @$argv; }
+        POSIX::_exit(127);
+    }
+
+    waitpid($pid, 0);
+
+    return $?;
+}
+
+sub pump {
+    my ($job, $run, $out_r, $err_r, $keep_output) = @_;
+
+    my %buffer = ($out_r => '', $err_r => '');
+    my %stream = ($out_r => 'stdout', $err_r => 'stderr');
+
+    my $select = IO::Select->new($out_r, $err_r);
+
+    my $lines = 0;
+    my $truncated = 0;
+    my @tail;
+
+    while (my @ready = $select->can_read()) {
+        for my $fh (@ready) {
+            my $chunk = '';
+            my $bytes = sysread($fh, $chunk, $READ_CHUNK);
+
+            if (!defined $bytes) {
+                next if $! == POSIX::EINTR();
+                $select->remove($fh);
+                next;
+            }
+
+            if ($bytes == 0) {
+                $select->remove($fh);
+                # Whatever is left without a trailing newline is still a line
+                # the job wrote, and dropping it would silently lose the last
+                # thing a crashing job said.
+                if (length $buffer{$fh}) {
+                    ($lines, $truncated) = emit(
+                        $job, $run, $stream{$fh}, $buffer{$fh}, $keep_output,
+                        $lines, $truncated, \@tail,
+                    );
+                    $buffer{$fh} = '';
+                }
+                next;
+            }
+
+            $buffer{$fh} .= $chunk;
+
+            while ((my $nl = index($buffer{$fh}, "\n")) >= 0) {
+                my $line = substr($buffer{$fh}, 0, $nl, '');
+                substr($buffer{$fh}, 0, 1, '');
+                ($lines, $truncated) = emit(
+                    $job, $run, $stream{$fh}, $line, $keep_output,
+                    $lines, $truncated, \@tail,
+                );
+            }
+
+            # A job printing megabytes with no newline would otherwise grow this
+            # buffer without bound. Cut it at the line cap and treat it as a
+            # line; the job keeps running.
+            #
+            # A `while`, not an `if`: one read brings in up to $READ_CHUNK bytes,
+            # which is larger than the line cap. Cutting once per read would
+            # still leave the buffer growing by the difference on every pass —
+            # unbounded growth at a slower rate, which is the same bug.
+            while (length($buffer{$fh}) > $MAX_LINE_BYTES) {
+                my $line = substr($buffer{$fh}, 0, $MAX_LINE_BYTES, '');
+                ($lines, $truncated) = emit(
+                    $job, $run, $stream{$fh}, $line, $keep_output,
+                    $lines, $truncated, \@tail,
+                );
+            }
+        }
+
+        last if !$select->count();
+    }
+
+    close($out_r);
+    close($err_r);
+
+    return { lines => $lines, truncated => $truncated, tail => \@tail };
+}
+
+sub emit {
+    my ($job, $run, $stream, $line, $keep_output, $lines, $truncated, $tail) = @_;
+
+    $line =~ s/\r\z//;
+
+    $lines++;
+
+    # Past the cap we still counted the line and we still read it — the caller's
+    # loop must keep draining or the child blocks forever — but nothing more is
+    # forwarded, and exactly one truncation notice is recorded.
+    if ($lines > $MAX_LINES) {
+        if (!$truncated) {
+            $truncated = 1;
+            ProxmodCron::Journal::send_entry({
+                %{ ProxmodCron::Journal::job_fields($job) },
+                MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{output},
+                PROXMOD_CRON_EVENT => 'output',
+                PROXMOD_CRON_RUN => $run,
+                PROXMOD_CRON_STREAM => $stream,
+                PRIORITY => 4,
+                MESSAGE => "[proxmod-cron] output truncated after $MAX_LINES lines",
+            });
+        }
+        return ($lines, $truncated);
+    }
+
+    return ($lines, $truncated) if !$keep_output;
+
+    $line = substr($line, 0, $MAX_LINE_BYTES) if length($line) > $MAX_LINE_BYTES;
+
+    push @$tail, "$stream: $line";
+    shift @$tail while @$tail > $ProxmodCron::State::TAIL_LINES;
+
+    ProxmodCron::Journal::send_entry({
+        %{ ProxmodCron::Journal::job_fields($job) },
+        MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{output},
+        PROXMOD_CRON_EVENT => 'output',
+        PROXMOD_CRON_RUN => $run,
+        PROXMOD_CRON_STREAM => $stream,
+        PRIORITY => ($stream eq 'stderr' ? 4 : 6),
+        MESSAGE => $line,
+    });
+
+    return ($lines, $truncated);
+}

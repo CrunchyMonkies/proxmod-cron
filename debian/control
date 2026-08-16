@@ -1,0 +1,42 @@
+Source: proxmod-cron
+Section: admin
+Priority: optional
+Maintainer: proxmod-cron maintainers <proxmod-cron@localhost>
+Build-Depends:
+ debhelper-compat (= 13),
+ perl,
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: proxmod-cron
+Architecture: all
+Depends:
+ ${misc:Depends},
+ ${perl:Depends},
+ proxmod (>= 0.2.0),
+ cron | cron-daemon,
+ systemd-sysv | systemd,
+Description: cron management for Proxmox VE, as a proxmod extension
+ Adds cron management to the Proxmox VE web interface: a Cron tab in the
+ datacenter view for cluster-wide entries, a Cron tab in the node view for
+ host entries, a read-only inventory of every other cron entry on the host,
+ and per-run history with captured output.
+ .
+ Job definitions are rendered into real files under /etc/cron.d and executed by
+ the system's own cron. There is no new daemon and no scheduler of its own:
+ what an administrator sees with cat is what runs. Cluster definitions live in
+ /etc/pve/proxmod/cron.cfg and are replicated by pmxcfs, so a job created on one
+ node appears on the others within a minute.
+ .
+ Run tracking and captured output are written to the systemd journal as
+ structured entries, which means retention, rotation and access are the host's
+ existing settings rather than a log store this package invents. Nothing about
+ a job running depends on that history existing.
+ .
+ Other extensions can register job types, manage jobs through a Perl client, and
+ contribute editor forms through a documented JavaScript namespace. A job created
+ that way can be enabled and disabled by an administrator but not edited or
+ removed behind the owning extension's back.
+ .
+ This package is not standalone: it is a proxmod extension and does nothing
+ without proxmod installed.

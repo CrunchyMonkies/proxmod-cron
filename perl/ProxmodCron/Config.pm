@@ -1,0 +1,570 @@
+package ProxmodCron::Config;
+
+use strict;
+use warnings;
+
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL LOCK_EX LOCK_NB);
+use File::Path ();
+use JSON::PP ();
+
+use ProxmodCron::Registry;
+use ProxmodCron::Spec;
+
+# The two definition stores.
+#
+# JSON rather than PVE::SectionConfig, and our own validation rather than
+# PVE::JSONSchema, for one reason: proxmod-cron-sync loads this module from cron
+# with no PVE in @INC. Every dependency here is core Perl.
+#
+# Strict on write, tolerant of unknown keys on read — a newer node in the
+# cluster may write a field this one does not know about, and dropping the whole
+# file over it would stop this node's jobs from rendering.
+
+our $VERSION = '0.1.0';
+
+# Test override, guarded the same way proxmod's own does it: honoured only when
+# the process is not root, so it can never be used to redirect a production
+# write into someone's home directory.
+my $PREFIX = ($> != 0 && defined $ENV{PROXMOD_CRON_TEST_PREFIX})
+    ? _untaint_path($ENV{PROXMOD_CRON_TEST_PREFIX})
+    : '';
+
+our $CLUSTER_FILE = "$PREFIX/etc/pve/proxmod/cron.cfg";
+our $NODE_FILE = "$PREFIX/etc/proxmod/cron.cfg";
+our $STATE_DIR = "$PREFIX/var/lib/proxmod/cron";
+our $CRON_D = "$PREFIX/etc/cron.d";
+
+our $STORE_VERSION = 1;
+
+# The registry cannot compute this itself — it is loaded before this module and
+# would have to read the environment a second time. One place decides.
+$ProxmodCron::Registry::TYPES_DIR = "$PREFIX/usr/share/proxmod-cron/types.d"
+    if $PREFIX ne '';
+
+# Matches proxmod's own extension-id rule, so a job id is always safe in a
+# filename, a URL path segment and a journal field value. The capture group is
+# not decoration: this pattern is used to untaint, and a match with no group
+# yields 1 rather than the string.
+our $ID_PATTERN = qr/\A([a-z0-9][a-z0-9_-]{0,63})\z/;
+
+my @SCOPES = qw(cluster node);
+
+sub _untaint_path {
+    my ($path) = @_;
+    return '' if !defined $path;
+    my ($clean) = ($path =~ m{\A([\w./@+-]{0,4096})\z});
+    return defined($clean) ? $clean : '';
+}
+
+=head2 file_for($scope)
+
+Where a scope's definitions live.
+
+=cut
+
+sub file_for {
+    my ($scope) = @_;
+
+    return $CLUSTER_FILE if $scope eq 'cluster';
+    return $NODE_FILE if $scope eq 'node';
+
+    die "unknown scope '$scope'\n";
+}
+
+sub scopes { return [@SCOPES] }
+
+=head2 prefix()
+
+The test prefix, or ''. Other modules build their own absolute paths from this
+rather than reading the environment again, so there is one place that decides
+whether the override is honoured.
+
+=cut
+
+sub prefix { return $PREFIX }
+
+sub state_dir { return $STATE_DIR }
+
+=head2 job_lock_path($scope, $id)
+
+The per-job run lock. proxmod-cron-exec holds it for the life of a run;
+ProxmodCron::Runs tests it to tell a job that is still running from one whose
+node lost power mid-run. Both must agree on the path, so it is defined once.
+
+=cut
+
+sub job_lock_path {
+    my ($scope, $id) = @_;
+    return "$STATE_DIR/run-$scope-$id.lock";
+}
+
+sub sync_lock_path { return "$STATE_DIR/sync.lock" }
+
+sub cron_d { return $CRON_D }
+
+=head2 load($scope)
+
+Read a store. B<Never dies.> Returns
+C<< { version, mailto, jobs => {...}, error => $msg } >>, where C<error> is set
+and C<jobs> is empty if the file could not be read or parsed.
+
+Fail-soft is the point: a corrupt cluster file arriving over pmxcfs must not
+stop this node's own jobs from rendering. The error is reported through the API
+and by C<proxmod-cronctl doctor> rather than by taking the renderer down.
+
+=cut
+
+sub load {
+    my ($scope) = @_;
+
+    my $file = file_for($scope);
+    my $empty = { version => $STORE_VERSION, mailto => '', jobs => {} };
+
+    my $raw = _slurp($file);
+
+    # A missing store is the normal state of a fresh install, not an error.
+    return $empty if !defined $raw;
+
+    return { %$empty, error => "$file is empty" } if $raw !~ /\S/;
+
+    my $data = eval { JSON::PP->new->utf8->relaxed->decode($raw) };
+    if (!$data || ref($data) ne 'HASH') {
+        my $why = $@ || 'not a JSON object';
+        $why =~ s/\s+at\s+\S+\s+line\s+\d+\.?\s*\z//;
+        $why =~ s/\s+\z//;
+        return { %$empty, error => "$file is not valid JSON: $why" };
+    }
+
+    my $jobs = $data->{jobs};
+    $jobs = {} if !$jobs || ref($jobs) ne 'HASH';
+
+    my $store = {
+        version => $data->{version} || $STORE_VERSION,
+        mailto => defined($data->{mailto}) ? $data->{mailto} : '',
+        jobs => {},
+    };
+
+    # Store-level operational limits, read by proxmod-cron-exec. They live in
+    # the node store because they are about this node's journald, not about the
+    # jobs themselves.
+    for my $key (qw(max_lines max_line_bytes)) {
+        next if !defined $data->{$key};
+        my ($value) = ("$data->{$key}" =~ /\A([0-9]{1,9})\z/);
+        $store->{$key} = 0 + $value if defined $value && $value > 0;
+    }
+
+    my @rejected;
+    for my $id (sort keys %$jobs) {
+        my $cfg = $jobs->{$id};
+
+        if (ref($cfg) ne 'HASH') {
+            push @rejected, $id;
+            next;
+        }
+
+        # Untaint on the way in. Everything here came off the filesystem, and
+        # inside pvedaemon that means it is tainted; a job id reaches a filename
+        # and a journal field, and a schedule reaches a crontab line.
+        my $clean = _untaint_job($id, $cfg);
+        if (!$clean) {
+            push @rejected, $id;
+            next;
+        }
+
+        $store->{jobs}->{ $clean->{id} } = $clean->{cfg};
+    }
+
+    $store->{error} = 'ignored malformed job definitions: ' . join(', ', @rejected)
+        if @rejected;
+
+    return $store;
+}
+
+=head2 untaint_job($id, $cfg, %opts)
+
+The cleaned job, or undef if any part of it could not be described exactly.
+
+The REST layer runs incoming parameters through this as well as the loader
+running stored ones through it, so there is one definition of what a job may
+contain. Pass C<< partial => 1 >> for an update delta, where a key that was not
+supplied must stay absent rather than being filled with a default that would
+then overwrite the stored value.
+
+=cut
+
+sub untaint_job {
+    my ($id, $cfg, %opts) = @_;
+
+    my $clean = _untaint_job($id, $cfg, %opts);
+
+    return $clean ? $clean->{cfg} : undef;
+}
+
+# Rebuild a job from strict captures. Anything that does not match is dropped
+# rather than laundered — a job we cannot describe exactly is a job we should
+# not be executing as root.
+sub _untaint_job {
+    my ($id, $cfg, %opts) = @_;
+
+    my $partial = $opts{partial} ? 1 : 0;
+
+    my ($clean_id) = ($id =~ $ID_PATTERN);
+    return undef if !defined $clean_id;
+
+    my %out;
+
+    if (!$partial || defined $cfg->{type}) {
+        my ($type) = (($cfg->{type} || '') =~ /\A([a-z0-9][a-z0-9_-]{0,63})\z/);
+        return undef if !defined $type;
+        $out{type} = $type;
+    }
+
+    if (!$partial || defined $cfg->{schedule}) {
+        my ($schedule) = (($cfg->{schedule} || '') =~ /\A([\x20-\x7e]{1,256})\z/);
+        return undef if !defined $schedule;
+        $out{schedule} = $schedule;
+    }
+
+    if (!$partial || defined $cfg->{origin}) {
+        my ($origin) = (($cfg->{origin} || 'user') =~ /\A(user|extension)\z/);
+        return undef if !defined $origin;
+        $out{origin} = $origin;
+    }
+
+    if (defined $cfg->{owner}) {
+        my ($owner) = ($cfg->{owner} =~ $ID_PATTERN);
+        return undef if !defined $owner;
+        $out{owner} = $owner;
+    }
+
+    if (!$partial || defined $cfg->{user}) {
+        my ($user) = ((defined($cfg->{user}) ? $cfg->{user} : 'root')
+            =~ /\A([a-z_][a-z0-9_-]{0,31})\z/);
+        return undef if !defined $user;
+        $out{user} = $user;
+    }
+
+    if (defined $cfg->{comment}) {
+        # Comments render into the cron file as a comment line, so a newline
+        # would let one break out of it.
+        my ($comment) = ($cfg->{comment} =~ /\A([^\0\n\r]{0,512})\z/);
+        $out{comment} = defined($comment) ? $comment : '';
+    }
+
+    for my $key (qw(enabled track keep_output)) {
+        next if $partial && !defined $cfg->{$key};
+        $out{$key} = _bool($cfg->{$key}, 1);
+    }
+
+    if (defined $cfg->{nodes}) {
+        return undef if ref($cfg->{nodes}) ne 'ARRAY';
+        my @nodes;
+        for my $node (@{ $cfg->{nodes} }) {
+            my ($clean) = (($node || '') =~ /\A([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)\z/);
+            return undef if !defined $clean;
+            push @nodes, $clean;
+        }
+        $out{nodes} = \@nodes;
+    }
+
+    # Type-specific keys. The plugin's schema decides what they mean; this only
+    # decides that they cannot carry a NUL or a newline into an argv.
+    my %known = map { $_ => 1 } qw(
+        type schedule origin owner user comment enabled track keep_output nodes
+    );
+
+    for my $key (sort keys %$cfg) {
+        next if $known{$key};
+
+        my ($clean_key) = ($key =~ /\A([a-zA-Z_][a-zA-Z0-9_]{0,63})\z/);
+        return undef if !defined $clean_key;
+
+        my $value = $cfg->{$key};
+        my $clean_value = _untaint_value($value);
+        return undef if !defined $clean_value;
+
+        $out{$clean_key} = $clean_value;
+    }
+
+    return { id => $clean_id, cfg => \%out };
+}
+
+sub _untaint_value {
+    my ($value) = @_;
+
+    return '' if !defined $value;
+
+    if (ref($value) eq 'ARRAY') {
+        my @out;
+        for my $item (@$value) {
+            my $clean = _untaint_value($item);
+            return undef if !defined $clean;
+            push @out, $clean;
+        }
+        return \@out;
+    }
+
+    return undef if ref($value) && !JSON::PP::is_bool($value);
+
+    my $scalar = JSON::PP::is_bool($value) ? ($value ? 1 : 0) : "$value";
+
+    my ($clean) = ($scalar =~ /\A([^\0\n\r]{0,4096})\z/);
+    return $clean;
+}
+
+sub _bool {
+    my ($value, $default) = @_;
+
+    return $default ? 1 : 0 if !defined $value;
+    return $value ? 1 : 0 if JSON::PP::is_bool($value);
+    return 0 if $value eq '' || $value eq '0' || lc("$value") eq 'false';
+    return 1;
+}
+
+=head2 validate_job($id, $cfg, %opts)
+
+Every problem with a job definition, as a list of strings. Empty means valid.
+
+Used by the REST layer before a write and by C<proxmod-cronctl validate>, so a
+bad definition is refused at the boundary rather than discovered by the renderer
+at 02:30.
+
+=cut
+
+sub validate_job {
+    my ($id, $cfg, %opts) = @_;
+
+    my @errors;
+
+    push @errors, "job id '$id' is not valid (lowercase letters, digits,"
+        . " '-' and '_', starting with a letter or digit, up to 64 characters)"
+        if !defined $id || $id !~ $ID_PATTERN;
+
+    return \@errors if !$cfg || ref($cfg) ne 'HASH';
+
+    push @errors, 'job has no type' if !defined $cfg->{type};
+
+    my ($schedule_ok, $schedule_why) = ProxmodCron::Spec::validate($cfg->{schedule});
+    push @errors, "schedule: $schedule_why" if !$schedule_ok;
+
+    push @errors, "user '$cfg->{user}' is not a valid user name"
+        if defined $cfg->{user} && $cfg->{user} !~ /\A[a-z_][a-z0-9_-]{0,31}\z/;
+
+    push @errors, 'comment must not contain a newline'
+        if defined $cfg->{comment} && $cfg->{comment} =~ /[\n\r]/;
+
+    if (defined $cfg->{nodes}) {
+        if (ref($cfg->{nodes}) ne 'ARRAY') {
+            push @errors, "'nodes' must be a list of node names";
+        } else {
+            push @errors, "'nodes' is only meaningful in the cluster scope"
+                if ($opts{scope} || '') eq 'node';
+        }
+    }
+
+    push @errors, "'origin' is set by the server and cannot be supplied"
+        if $cfg->{origin} && !$opts{allow_origin};
+
+    if (defined $cfg->{type}) {
+        push @errors, @{ ProxmodCron::Registry::validate($cfg->{type}, $cfg) };
+    }
+
+    return \@errors;
+}
+
+=head2 save($scope, $store)
+
+Write a store atomically. Mode 0600 — a job definition is a command that runs as
+root, so the file is as sensitive as the commands in it.
+
+This does I<not> take the lock itself: a caller doing read-modify-write must
+hold it across both halves, so taking it here would either be redundant or, on a
+second open of the same file, deadlock against the caller's own handle. Use
+lock() around the whole sequence.
+
+=cut
+
+sub save {
+    my ($scope, $store) = @_;
+
+    my $file = file_for($scope);
+
+    my $out = {
+        version => $STORE_VERSION,
+        mailto => defined($store->{mailto}) ? $store->{mailto} : '',
+        jobs => $store->{jobs} || {},
+    };
+
+    for my $key (qw(max_lines max_line_bytes)) {
+        $out->{$key} = 0 + $store->{$key} if $store->{$key};
+    }
+
+    # canonical => sorted keys, so an unchanged store produces a byte-identical
+    # file and pmxcfs does not replicate a no-op change across the cluster.
+    my $json = JSON::PP->new->utf8->pretty->canonical->encode($out);
+
+    mkdir_p(_dirname($file));
+    _write_atomic($file, $json, 0600);
+
+    return 1;
+}
+
+=head2 lock($scope, $code)
+
+Run C<$code> holding this scope's exclusive lock. The lock lives under
+/var/lib/proxmod/cron rather than next to the config, because the cluster config
+is on pmxcfs and flock semantics there are not something to rely on.
+
+Note this is a I<node-local> lock. Cross-node serialisation for the cluster
+store is pmxcfs's job and is taken by the API layer, which is the only caller
+that has PVE::Cluster available.
+
+=cut
+
+sub lock {
+    my ($scope, $code) = @_;
+
+    my $dir = $STATE_DIR;
+    mkdir_p($dir);
+
+    my $path = "$dir/$scope.lock";
+
+    open(my $fh, '>>', $path) or die "cannot open lock $path: $!\n";
+
+    my $ok = 0;
+    for (1 .. 50) {
+        if (flock($fh, LOCK_EX | LOCK_NB)) {
+            $ok = 1;
+            last;
+        }
+        select(undef, undef, undef, 0.1);
+    }
+
+    if (!$ok) {
+        close($fh);
+        die "timed out waiting for the $scope lock\n";
+    }
+
+    my @result = eval { $code->() };
+    my $err = $@;
+
+    close($fh);
+
+    die $err if $err;
+
+    return wantarray ? @result : $result[0];
+}
+
+sub _slurp {
+    my ($path) = @_;
+
+    # Bytes, not characters: open() with an :encoding layer cannot open a
+    # tainted path inside a daemon under -T [PVE-F-040]. Decode afterwards.
+    open(my $fh, '<', $path) or return undef;
+    binmode($fh);
+    local $/;
+    my $content = <$fh>;
+    close($fh);
+
+    return defined($content) ? $content : '';
+}
+
+sub _write_atomic {
+    my ($path, $content, $mode) = @_;
+
+    my $tmp = "$path.tmp.$$";
+
+    sysopen(my $fh, $tmp, O_WRONLY | O_CREAT | O_EXCL, $mode)
+        or die "cannot create $tmp: $!\n";
+    binmode($fh);
+
+    print {$fh} $content
+        or do { close($fh); unlink($tmp); die "cannot write $tmp: $!\n" };
+
+    close($fh)
+        or do { unlink($tmp); die "cannot write $tmp: $!\n" };
+
+    chmod($mode, $tmp);
+
+    rename($tmp, $path)
+        or do { unlink($tmp); die "cannot replace $path: $!\n" };
+
+    return 1;
+}
+
+sub mkdir_p {
+    my ($dir) = @_;
+
+    return 1 if -d $dir;
+
+    eval { File::Path::make_path($dir, { mode => 0700 }) };
+
+    die "cannot create $dir: $@\n" if !-d $dir;
+
+    return 1;
+}
+
+sub _dirname {
+    my ($path) = @_;
+    my $dir = $path;
+    $dir =~ s{/[^/]*\z}{};
+    return $dir eq '' ? '/' : $dir;
+}
+
+=head2 effective($scope, $store, $id)
+
+A job with its defaults filled in, as the renderer and the API both want it.
+One place decides what C<track> defaults to so the two can never disagree.
+
+=cut
+
+sub effective {
+    my ($scope, $store, $id) = @_;
+
+    my $cfg = $store->{jobs}->{$id};
+    return undef if !$cfg;
+
+    my $class = ProxmodCron::Registry::lookup($cfg->{type});
+
+    my %job = (
+        %$cfg,
+        id => $id,
+        scope => $scope,
+        origin => $cfg->{origin} || 'user',
+        enabled => defined($cfg->{enabled}) ? ($cfg->{enabled} ? 1 : 0) : 1,
+        user => $cfg->{user} || ($class ? $class->run_as() : 'root'),
+    );
+
+    $job{track} = defined($cfg->{track})
+        ? ($cfg->{track} ? 1 : 0)
+        : ($class ? ($class->track_default() ? 1 : 0) : 1);
+
+    $job{keep_output} = defined($cfg->{keep_output}) ? ($cfg->{keep_output} ? 1 : 0) : 1;
+
+    return \%job;
+}
+
+=head2 targets_node($job, $nodename)
+
+Whether a cluster job renders on this node. An absent or empty C<nodes> list, or
+one containing 'all', means every node — the permissive reading, because a
+cluster job with no targeting is the common case and should not silently run
+nowhere.
+
+=cut
+
+sub targets_node {
+    my ($job, $nodename) = @_;
+
+    my $nodes = $job->{nodes};
+    return 1 if !$nodes || ref($nodes) ne 'ARRAY' || !@$nodes;
+
+    for my $node (@$nodes) {
+        return 1 if $node eq 'all';
+        return 1 if defined($nodename) && $node eq $nodename;
+    }
+
+    return 0;
+}
+
+1;

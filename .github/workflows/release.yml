@@ -1,0 +1,95 @@
+name: release
+
+# Publishes a .deb to a GitHub Release whenever a version tag is pushed. It
+# builds its own package rather than reaching for ci.yml's artifact, because a
+# release should never depend on a workflow whose trigger (push to main) may or
+# may not have run for the exact commit being tagged.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build and publish release
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential debhelper devscripts perl fakeroot
+          useradd -m ci
+          chown -R ci:ci .
+          chown ci:ci ..
+
+      # A tag is a promise that its version and the package's agree. Catch the
+      # case where someone tags before bumping debian/changelog, or after, before
+      # it ships a release under the wrong name.
+      - name: tag matches debian/changelog version
+        run: |
+          set -e
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version=$(dpkg-parsechangelog -S Version)
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "tag v$tag_version does not match debian/changelog version $pkg_version" >&2
+            exit 1
+          fi
+
+      # The manifest version is what proxmod reports for the extension, and the
+      # JS namespace's ProxmodCron.version is what another extension checks
+      # before using an API it needs. Three copies of one number is three
+      # chances to ship a release that lies about itself.
+      - name: manifest and frontend agree on the version
+        run: |
+          set -e
+          pkg_version=$(dpkg-parsechangelog -S Version)
+          manifest=$(perl -MJSON::PP -0777 -ne 'print JSON::PP->new->decode($_)->{version}' \
+                       conf/50-proxmod-cron.conf)
+          frontend=$(perl -ne "print \$1 if /^\s*var VERSION = '([^']+)'/" www/proxmod-cron.js)
+          for got in "$manifest" "$frontend"; do
+            if [ "$got" != "$pkg_version" ]; then
+              echo "version mismatch: changelog $pkg_version, manifest $manifest, frontend $frontend" >&2
+              exit 1
+            fi
+          done
+
+      # Rules-Requires-Root: no in debian/control means this package is built by
+      # a non-root user, with fakeroot faking root only where dpkg needs it.
+      - name: dpkg-buildpackage
+        run: su ci -c 'dpkg-buildpackage -us -uc -b'
+
+      - name: the package depends on proxmod
+        run: dpkg -I ../proxmod-cron_*_all.deb | grep -E 'Depends:.*proxmod \(>= 0\.2\.0\)'
+
+      # softprops/action-gh-release rejects glob patterns containing a '..'
+      # segment, and dpkg-buildpackage always writes one directory up.
+      - name: collect artifacts
+        run: |
+          mkdir -p dist
+          cp ../proxmod-cron_*_all.deb dist/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*_all.deb
+          generate_release_notes: true
+          body: |
+            **This package is not standalone.** proxmod-cron is a proxmod
+            extension and does nothing without it:
+
+                apt install ./proxmod-cron_*_all.deb
+
+            will refuse unless `proxmod (>= 0.2.0)` is already installed.
+            Installing it restarts `pvedaemon` and `pveproxy` through proxmod's
+            dpkg trigger.
+
+            Already-rendered jobs under `/etc/cron.d` keep running if proxmod is
+            later disabled — disabling the framework stops management, not
+            execution and not run tracking.

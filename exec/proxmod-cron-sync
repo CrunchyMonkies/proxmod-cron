@@ -1,0 +1,56 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(GetOptions);
+
+use ProxmodCron::Sync;
+
+# The convergence loop, and the reason this extension needs no daemon.
+#
+# /etc/cron.d/proxmod-cron (our one conffile) runs this every minute. It reads
+# both definition stores and rewrites the two generated cron.d files when — and
+# only when — the rendered text differs from what is on disk. That is what makes
+# a cluster job created on node A appear on node B, and it means the package
+# needs no postinst to bootstrap itself.
+#
+# It runs outside any daemon, so NO PVE MODULE MAY BE LOADED from here or from
+# anything it uses. That constraint is why ProxmodCron::Config parses its own
+# JSON and ProxmodCron::Spec parses its own cron syntax.
+#
+# Note what the anchor file deliberately does NOT set: MAILTO="". The generated
+# files empty it because proxmod-cron-exec captures job output into journald
+# instead, but a failure *here* has no such capture, so it should reach root the
+# ordinary way.
+
+our $VERSION = '0.1.0';
+
+my $verbose = 0;
+my $dry_run = 0;
+my $wait = 0;
+
+GetOptions(
+    'verbose|v' => \$verbose,
+    'dry-run|n' => \$dry_run,
+    'wait|w' => \$wait,
+) or die "usage: proxmod-cron-sync [--verbose] [--dry-run] [--wait]\n";
+
+my $result = ProxmodCron::Sync::run(wait => $wait, dry_run => $dry_run);
+
+warn "proxmod-cron: $_\n" for @{ $result->{errors} };
+
+if ($verbose) {
+    if ($result->{skipped}) {
+        print "another sync is already running\n";
+    } else {
+        for my $scope (sort keys %{ $result->{results} }) {
+            printf("%s: %s\n", $scope, $result->{results}->{$scope} || 'unchanged');
+        }
+    }
+}
+
+# A store that would not parse is reported but is not a failure of this run: the
+# other scope still rendered, and cron mailing root every minute about a file
+# only an administrator can fix would bury the one message that mattered.
+exit(0);

@@ -1,0 +1,14 @@
+# Added by hand by an administrator. proxmod-cron must list it and never touch
+# it: it is not in a file we generate, so it is not ours to change.
+MAILTO=ops@example.invalid
+
+*/5 * * * *	backup	/usr/local/bin/dump --stamp \%F%this line is stdin, not command
+0 4 * * *	root	/usr/local/sbin/nightly
+
+# Six fields are the minimum in /etc/cron.d. This one has five, so cron will
+# never run it and neither will we report it as a job.
+0 4 * * *	/usr/local/sbin/no-user-column
+
+# A minute that does not exist. cron will not run this either, and the
+# administrator has no way of knowing unless something says so.
+99 * * * *	root	/usr/local/sbin/never-runs

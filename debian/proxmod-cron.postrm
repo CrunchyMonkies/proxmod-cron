@@ -1,0 +1,41 @@
+#!/bin/sh
+# The one maintainer script in this package, and it only removes things.
+#
+# /etc/cron.d/proxmod-cron-cluster and /etc/cron.d/proxmod-cron-node are written
+# at runtime by proxmod-cron-sync, so dpkg does not know about them and will not
+# take them away. Leaving them would leave cron running lines that point at a
+# deleted /usr/lib/proxmod-cron/proxmod-cron-exec — once a minute, mailing root
+# about it every time. So they go on remove, not only on purge.
+#
+# What is deliberately NOT touched:
+#
+#   /etc/pve/proxmod/cron.cfg  cluster configuration, replicated. Purging one
+#                              node of a cluster must not delete the cluster's
+#                              data out from under the others.
+#   the journal                run history and captured output are the evidence
+#                              of what ran on this host. A package purge has no
+#                              business vacuuming the host's logs.
+
+set -e
+
+case "$1" in
+    remove|purge)
+        rm -f /etc/cron.d/proxmod-cron-cluster /etc/cron.d/proxmod-cron-node
+        ;;
+esac
+
+case "$1" in
+    purge)
+        # Derived state only: the last-run cache and the lock files. Losing it
+        # costs a `proxmod-cronctl reindex`.
+        rm -rf /var/lib/proxmod/cron
+        rmdir /var/lib/proxmod 2>/dev/null || true
+        # This node's own job definitions. Purge means "remove configuration",
+        # and unlike the cluster store this file belongs to this host alone.
+        rm -f /etc/proxmod/cron.cfg
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

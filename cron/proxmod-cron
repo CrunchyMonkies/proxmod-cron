@@ -1,0 +1,29 @@
+# /etc/cron.d/proxmod-cron — the convergence anchor for proxmod-cron.
+#
+# This is the only file in this package an administrator is meant to edit, and
+# it is a dpkg conffile, so your changes survive upgrades.
+#
+# It is NOT where cron jobs go. proxmod-cron-sync reads the definition stores
+#
+#     /etc/pve/proxmod/cron.cfg   (cluster-wide, replicated by pmxcfs)
+#     /etc/proxmod/cron.cfg       (this node only)
+#
+# and rewrites /etc/cron.d/proxmod-cron-cluster and /etc/cron.d/proxmod-cron-node
+# whenever their rendered content changes — which is what makes a job created on
+# one node appear on the others, with no daemon and no maintainer script. Those
+# two files are generated: edit them and the next sync overwrites you. Edit the
+# stores through the web interface, the REST API, or `proxmod-cronctl`.
+#
+# Running this every minute costs a fraction of a second and no write when
+# nothing changed. Lengthen the interval if you want to; the only effect is how
+# long a cluster job takes to appear on the other nodes.
+#
+# MAILTO is deliberately not set here. The generated files empty it, because
+# proxmod-cron-exec captures job output into the journal instead — but a failure
+# of the sync itself has no such capture, so it should reach root the ordinary
+# way.
+
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+* * * * *	root	[ -x /usr/lib/proxmod-cron/proxmod-cron-sync ] && /usr/lib/proxmod-cron/proxmod-cron-sync

@@ -1,0 +1,14 @@
+# dpkg-buildpackage writes its outputs one directory up; these are what it
+# leaves behind inside the tree.
+debian/proxmod-cron/
+debian/.debhelper/
+debian/files
+debian/*.substvars
+debian/debhelper-build-stamp
+
+# `make deb` and the CI "collect artifacts" step.
+dist/
+
+# Agent tooling scratch state, not project content.
+.omc/
+.serena/

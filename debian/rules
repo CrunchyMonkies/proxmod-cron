@@ -1,0 +1,15 @@
+#!/usr/bin/make -f
+
+# dh's makefile buildsystem calls `make build` and `make install DESTDIR=…`,
+# which is the entire build.
+#
+# dh_installcron is not used: the anchor is a conffile with a header explaining
+# what it is, installed by the Makefile like any other file under /etc, and
+# dh_installdeb registers everything under /etc as a conffile on its own.
+#
+# The test suite is not run here. It is run in CI, where a failure is visible;
+# running it during a package build would make an unbuildable package out of an
+# unrelated environment problem on the build host.
+
+%:
+	dh $@

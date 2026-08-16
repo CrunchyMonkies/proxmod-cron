@@ -1,0 +1,16 @@
+proxmod-cron (0.1.0) unstable; urgency=medium
+
+  * Initial release: cron management for Proxmox VE as a proxmod extension.
+  * Cluster and node definition stores, rendered into /etc/cron.d by a
+    one-line anchor conffile that needs no daemon and no maintainer script.
+  * Job-type plugin registry, Perl client and JavaScript namespace for other
+    extensions; a job an extension created can be enabled and disabled by an
+    administrator but not edited or removed behind its owner's back.
+  * Run tracking and captured output as structured journald entries, read back
+    with journalctl field matches; the last-run file under /var/lib is only a
+    cache and is rebuildable with `proxmod-cronctl reindex`.
+  * Access control expressed entirely in existing PVE privileges on existing
+    ACL paths, with per-job delegation for job types that declare what object
+    they are about.
+
+ -- proxmod-cron maintainers <proxmod-cron@localhost>  Sun, 16 Aug 2026 00:00:00 +0000

@@ -1,0 +1,820 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(GetOptionsFromArray);
+use POSIX ();
+
+use ProxmodCron::Config;
+use ProxmodCron::Inventory;
+use ProxmodCron::Journal;
+use ProxmodCron::Registry;
+use ProxmodCron::Render;
+use ProxmodCron::Runs;
+use ProxmodCron::Spec;
+use ProxmodCron::State;
+use ProxmodCron::Store;
+use ProxmodCron::Sync;
+
+# The administrator's way in when the UI is not reachable — which is exactly the
+# situation this extension has to be useful in, since a job that only exists in
+# a web interface is a job nobody can fix from a serial console.
+#
+# No PVE and no proxmod here, deliberately: `proxmodctl disable` stops
+# management, not execution, and this must keep working when it has.
+
+our $VERSION = '0.1.0';
+
+our @PLUGIN_ERRORS;
+
+my %COMMANDS = (
+    list => \&cmd_list,
+    show => \&cmd_show,
+    render => \&cmd_render,
+    validate => \&cmd_validate,
+    run => \&cmd_run,
+    sync => \&cmd_sync,
+    runs => \&cmd_runs,
+    log => \&cmd_log,
+    inventory => \&cmd_inventory,
+    reindex => \&cmd_reindex,
+    doctor => \&cmd_doctor,
+);
+
+exit(main(@ARGV));
+
+sub main {
+    my @args = @_;
+
+    my $command = shift @args;
+
+    if (!defined $command || $command eq '--help' || $command eq '-h' || $command eq 'help') {
+        usage();
+        return 0;
+    }
+
+    if ($command eq '--version') {
+        print "proxmod-cronctl $VERSION\n";
+        return 0;
+    }
+
+    my $handler = $COMMANDS{$command};
+    if (!$handler) {
+        print STDERR "proxmod-cronctl: unknown command '$command'\n";
+        usage(\*STDERR);
+        return 2;
+    }
+
+    # A plugin that will not load is why a job renders as a comment instead of
+    # running, so the failure is carried rather than swallowed: `doctor` reports
+    # it in full and every other command says it once on stderr.
+    @PLUGIN_ERRORS = ProxmodCron::Registry::load_plugins();
+
+    warn "proxmod-cronctl: $_\n" for ($command eq 'doctor' ? () : @PLUGIN_ERRORS);
+
+    my $status = eval { $handler->(@args) };
+    if ($@) {
+        my $why = $@;
+        $why =~ s/\s+\z//;
+        print STDERR "proxmod-cronctl: $why\n";
+        return 1;
+    }
+
+    return $status || 0;
+}
+
+sub usage {
+    my ($fh) = @_;
+    $fh ||= \*STDOUT;
+
+    print {$fh} <<'USAGE';
+usage: proxmod-cronctl <command> [options]
+
+  list [--scope cluster|node]        every defined job, with its next run
+  show <id> [--scope S]              one job in full, with its last run
+  render [--scope S] [--diff]        what would be written to /etc/cron.d
+  validate                           check both stores and every job in them
+  run <id> [--scope S]               run a job now, exactly as cron would
+  sync [--dry-run] [--wait]          render and write what changed
+  runs <id> [--limit N] [--since T]  run history, newest first
+  log <runid> [--follow]             one run's captured output
+  inventory                          every cron entry on this host
+  reindex                            rebuild the status cache from journald
+  doctor                             check what silently breaks cron and logging
+USAGE
+
+    return;
+}
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+
+sub scopes_from {
+    my ($scope) = @_;
+
+    return @{ ProxmodCron::Config::scopes() } if !defined $scope;
+
+    die "unknown scope '$scope', expected 'cluster' or 'node'\n"
+        if $scope ne 'cluster' && $scope ne 'node';
+
+    return ($scope);
+}
+
+# The job, its scope and its store. Searched across both scopes unless one was
+# named, because an administrator reading an alert knows the job id and not
+# which file it lives in.
+sub find_job {
+    my ($id, $scope) = @_;
+
+    for my $candidate (scopes_from($scope)) {
+        my $store = ProxmodCron::Config::load($candidate);
+        my $job = ProxmodCron::Config::effective($candidate, $store, $id);
+        return ($job, $candidate, $store) if $job;
+    }
+
+    die "no job named '$id'\n";
+}
+
+# The same helper the API and the UI read their can_* flags from, so the CLI
+# cannot describe a job's ownership differently from the grid.
+sub source_of {
+    my ($job) = @_;
+
+    my $caps = ProxmodCron::Store::capabilities($job);
+
+    return 'custom' if $caps->{origin} ne 'extension';
+
+    my $owner = defined($caps->{owner}) ? $caps->{owner} : 'unknown';
+
+    return $caps->{orphaned} ? "$owner (orphaned)" : $owner;
+}
+
+sub last_run_summary {
+    my ($record) = @_;
+
+    return 'never run' if !$record;
+
+    my $state = $record->{state} || 'unknown';
+
+    return "killed (signal $record->{signal})" if $state eq 'killed';
+    return "exit $record->{exit}" if $state eq 'failed';
+    return $state;
+}
+
+sub stamp {
+    my ($epoch) = @_;
+
+    return '-' if !defined $epoch;
+
+    my @t = localtime($epoch);
+
+    return POSIX::strftime('%Y-%m-%d %H:%M:%S', @t);
+}
+
+# A plain aligned table. Nothing here is parsed by anything, so this stays a
+# report for a human rather than growing a --json mode nobody asked for.
+sub table {
+    my ($headers, $rows) = @_;
+
+    my @width = map { length($_) } @$headers;
+
+    for my $row (@$rows) {
+        for my $i (0 .. $#$row) {
+            my $len = length(defined($row->[$i]) ? $row->[$i] : '');
+            $width[$i] = $len if $len > $width[$i];
+        }
+    }
+
+    my $format = join('  ', map { "%-${_}s" } @width) . "\n";
+
+    printf($format, @$headers);
+    printf($format, map { '-' x $_ } @width);
+
+    for my $row (@$rows) {
+        printf($format, map { defined($_) ? $_ : '' } @$row);
+    }
+
+    return;
+}
+
+# ---------------------------------------------------------------------------
+
+sub cmd_list {
+    my @args = @_;
+
+    my $scope;
+    GetOptionsFromArray(\@args, 'scope=s' => \$scope) or die "bad options for list\n";
+
+    my $nodename = ProxmodCron::Sync::nodename();
+    my $cache = ProxmodCron::State::load();
+
+    my @rows;
+
+    for my $candidate (scopes_from($scope)) {
+        my $store = ProxmodCron::Config::load($candidate);
+        warn "proxmod-cronctl: $store->{error}\n" if $store->{error};
+
+        for my $row (@{ ProxmodCron::Render::summary($candidate, $store, $nodename) }) {
+            my $job = ProxmodCron::Config::effective($candidate, $store, $row->{id});
+
+            push @rows, [
+                $row->{enabled} ? 'on' : 'off',
+                $candidate,
+                $row->{id},
+                $row->{type},
+                source_of($job),
+                $row->{schedule},
+                # A job that is defined but does not render here is not going to
+                # run here, and saying 'next run' for it would be a lie.
+                $row->{renders} ? stamp($row->{next_run}) : 'not on this node',
+                last_run_summary($cache->{ ProxmodCron::State::key($candidate, $row->{id}) }),
+            ];
+        }
+    }
+
+    if (!@rows) {
+        print "no jobs defined\n";
+        return 0;
+    }
+
+    table([qw(ENABLED SCOPE ID TYPE SOURCE SCHEDULE), 'NEXT RUN', 'LAST RESULT'], \@rows);
+
+    return 0;
+}
+
+sub cmd_show {
+    my @args = @_;
+
+    my $scope;
+    GetOptionsFromArray(\@args, 'scope=s' => \$scope) or die "bad options for show\n";
+
+    my $id = shift @args or die "usage: proxmod-cronctl show <id>\n";
+
+    my ($job, $found) = find_job($id, $scope);
+
+    printf("%-14s %s\n", 'id', $job->{id});
+    printf("%-14s %s\n", 'scope', $found);
+    printf("%-14s %s\n", 'type', $job->{type});
+    printf("%-14s %s\n", 'source', source_of($job));
+    printf("%-14s %s\n", 'enabled', $job->{enabled} ? 'yes' : 'no');
+    printf("%-14s %s\n", 'schedule', $job->{schedule});
+    printf("%-14s %s\n", 'user', $job->{user});
+    printf("%-14s %s\n", 'tracked', $job->{track} ? 'yes' : 'no');
+    printf("%-14s %s\n", 'keep output', $job->{keep_output} ? 'yes' : 'no');
+    printf("%-14s %s\n", 'comment', $job->{comment}) if defined $job->{comment};
+    printf("%-14s %s\n", 'nodes', join(', ', @{ $job->{nodes} }))
+        if $job->{nodes} && @{ $job->{nodes} };
+
+    my $argv = eval { ProxmodCron::Registry::build_command($job->{type}, $job) };
+    if ($argv) {
+        printf("%-14s %s\n", 'command',
+            join(' ', map { ProxmodCron::Render::quote($_) }
+                @{ ProxmodCron::Render::wrap($job, $argv) }));
+    } else {
+        my $why = $@ || 'no command';
+        chomp $why;
+        printf("%-14s %s\n", 'command', "UNAVAILABLE: $why");
+    }
+
+    my ($ok, $why) = ProxmodCron::Spec::validate($job->{schedule});
+    if ($ok) {
+        my $next = eval { ProxmodCron::Spec::next_runs($job->{schedule}, 3) } || [];
+        printf("%-14s %s\n", 'next runs', join(', ', map { stamp($_) } @$next));
+    } else {
+        printf("%-14s %s\n", 'schedule', "INVALID: $why");
+    }
+
+    my $record = ProxmodCron::State::get($found, $job->{id});
+    print "\nlast run\n";
+
+    if (!$record) {
+        print "  never run\n";
+        return 0;
+    }
+
+    printf("  %-12s %s\n", 'run', $record->{run});
+    printf("  %-12s %s\n", 'started', stamp($record->{started}));
+    printf("  %-12s %s\n", 'result', last_run_summary($record));
+    printf("  %-12s %s ms\n", 'duration', $record->{duration_ms})
+        if defined $record->{duration_ms};
+    printf("  %-12s %s%s\n", 'lines', $record->{lines} || 0,
+        $record->{truncated} ? ' (truncated)' : '');
+
+    if ($record->{tail} && @{ $record->{tail} }) {
+        print "  output tail\n";
+        print "    $_\n" for @{ $record->{tail} };
+    }
+
+    return 0;
+}
+
+sub cmd_render {
+    my @args = @_;
+
+    my ($scope, $diff);
+    GetOptionsFromArray(\@args, 'scope=s' => \$scope, 'diff' => \$diff)
+        or die "bad options for render\n";
+
+    my $nodename = ProxmodCron::Sync::nodename();
+    my $differs = 0;
+
+    for my $candidate (scopes_from($scope)) {
+        my $store = ProxmodCron::Config::load($candidate);
+        warn "proxmod-cronctl: $store->{error}\n" if $store->{error};
+
+        my $text = ProxmodCron::Render::render($candidate, $store, $nodename);
+        my $path = ProxmodCron::Render::path($candidate);
+
+        if (!$diff) {
+            print "# $path\n";
+            print defined($text) ? $text : "# nothing renders for this node\n";
+            next;
+        }
+
+        my $current = read_file($path);
+
+        my $before = defined($current) ? $current : '';
+        my $after = defined($text) ? $text : '';
+
+        if ($before eq $after) {
+            print "$path: unchanged\n";
+            next;
+        }
+
+        $differs = 1;
+        print "$path: would change\n";
+        print_changes($before, $after);
+    }
+
+    # An exit status a script can branch on: `proxmod-cronctl render --diff` in a
+    # check job answers "has anyone edited the generated files".
+    return $diff && $differs ? 1 : 0;
+}
+
+# Not a real diff — core Perl has no diff module and vendoring one for a CLI
+# convenience would be a poor trade. Common leading and trailing lines are
+# dropped and the rest is shown as removed and added, which is enough to answer
+# "what would change" without pretending to be `diff -u`.
+sub print_changes {
+    my ($before, $after) = @_;
+
+    my @old = split(/\n/, $before, -1);
+    my @new = split(/\n/, $after, -1);
+
+    my $head = 0;
+    $head++ while $head < @old && $head < @new && $old[$head] eq $new[$head];
+
+    my $tail = 0;
+    $tail++ while $tail < (@old - $head) && $tail < (@new - $head)
+        && $old[$#old - $tail] eq $new[$#new - $tail];
+
+    print "  - $_\n" for @old[$head .. $#old - $tail];
+    print "  + $_\n" for @new[$head .. $#new - $tail];
+
+    return;
+}
+
+sub cmd_validate {
+    my @args = @_;
+
+    my $scope;
+    GetOptionsFromArray(\@args, 'scope=s' => \$scope) or die "bad options for validate\n";
+
+    my @problems;
+    my $jobs = 0;
+
+    for my $candidate (scopes_from($scope)) {
+        my $store = ProxmodCron::Config::load($candidate);
+
+        push @problems, "$candidate store: $store->{error}" if $store->{error};
+
+        for my $id (sort keys %{ $store->{jobs} || {} }) {
+            $jobs++;
+
+            # The stored config, not the effective one: validate_job is the same
+            # check every write goes through, and it does not know about the
+            # defaults and the id/scope that effective() adds.
+            my $errors = ProxmodCron::Config::validate_job($id, $store->{jobs}->{$id},
+                scope => $candidate, allow_origin => 1);
+
+            if (@{ $errors || [] }) {
+                push @problems, "$candidate job '$id': $_" for @$errors;
+                # An invalid config would fail to build a command too, and
+                # reporting both would say the same thing twice.
+                next;
+            }
+
+            my $job = ProxmodCron::Config::effective($candidate, $store, $id);
+
+            my $argv = eval { ProxmodCron::Registry::build_command($job->{type}, $job) };
+            if (!$argv) {
+                my $reason = $@ || 'produced no command';
+                chomp $reason;
+                push @problems, "$candidate job '$id': $reason";
+            }
+        }
+    }
+
+    if (@problems) {
+        print "$_\n" for @problems;
+        printf("%d job%s checked, %d problem%s found\n",
+            $jobs, ($jobs == 1 ? '' : 's'),
+            scalar(@problems), (@problems == 1 ? '' : 's'));
+        return 1;
+    }
+
+    printf("%d job%s checked, no problems found\n", $jobs, ($jobs == 1 ? '' : 's'));
+
+    return 0;
+}
+
+sub cmd_run {
+    my @args = @_;
+
+    my $scope;
+    GetOptionsFromArray(\@args, 'scope=s' => \$scope) or die "bad options for run\n";
+
+    my $id = shift @args or die "usage: proxmod-cronctl run <id>\n";
+
+    my ($job, $found) = find_job($id, $scope);
+
+    my $argv = eval { ProxmodCron::Registry::build_command($job->{type}, $job) };
+    if (!$argv) {
+        my $why = $@ || 'produced no command';
+        chomp $why;
+        die "job '$id' has no runnable command: $why\n";
+    }
+
+    # Through the wrapper when the job is tracked, so a manual run is recorded
+    # in the same history as a scheduled one — and so it takes the same lock,
+    # which stops a hand-started run from overlapping a scheduled one.
+    my $cmd = ProxmodCron::Render::wrap($job, $argv);
+
+    print "running $found job '$id': "
+        . join(' ', map { ProxmodCron::Render::quote($_) } @$cmd) . "\n";
+
+    my $pid = fork();
+    die "cannot fork: $!\n" if !defined $pid;
+
+    if ($pid == 0) {
+        { exec { $cmd->[0] } @$cmd; }
+        POSIX::_exit(127);
+    }
+
+    waitpid($pid, 0);
+    my $status = $?;
+
+    if ($status & 127) {
+        printf("killed by signal %d\n", $status & 127);
+        return 1;
+    }
+
+    my $exit = $status >> 8;
+    print $exit == 0 ? "finished\n" : "exited $exit\n";
+
+    return $exit;
+}
+
+sub cmd_sync {
+    my @args = @_;
+
+    my ($dry_run, $wait);
+    GetOptionsFromArray(\@args, 'dry-run|n' => \$dry_run, 'wait|w' => \$wait)
+        or die "bad options for sync\n";
+
+    my $result = ProxmodCron::Sync::run(dry_run => $dry_run, wait => $wait);
+
+    print "another sync is already running\n" if $result->{skipped};
+
+    for my $candidate (sort keys %{ $result->{results} }) {
+        printf("%s: %s\n", $candidate, $result->{results}->{$candidate} || 'unchanged');
+    }
+
+    print STDERR "proxmod-cronctl: $_\n" for @{ $result->{errors} };
+
+    return @{ $result->{errors} } ? 1 : 0;
+}
+
+sub cmd_runs {
+    my @args = @_;
+
+    my ($limit, $since, $scope);
+    GetOptionsFromArray(\@args,
+        'limit=i' => \$limit, 'since=s' => \$since, 'scope=s' => \$scope,
+    ) or die "bad options for runs\n";
+
+    my $id = shift @args or die "usage: proxmod-cronctl runs <id>\n";
+
+    my $runs = ProxmodCron::Runs::list(
+        job => $id, scope => $scope, since => $since, limit => $limit || 20);
+
+    if (!@$runs) {
+        print "no runs recorded for '$id'\n";
+        print "(journald has no persistent storage on this host — see"
+            . " `proxmod-cronctl doctor`)\n" if !ProxmodCron::Runs::persistent();
+        return 0;
+    }
+
+    my @rows = map {
+        [
+            $_->{run},
+            stamp($_->{started}),
+            defined($_->{duration_ms}) ? "$_->{duration_ms} ms" : '-',
+            $_->{state},
+            defined($_->{exit}) ? $_->{exit} : '-',
+            ($_->{lines} || 0) . ($_->{truncated} ? '+' : ''),
+        ];
+    } @$runs;
+
+    table([qw(RUN STARTED DURATION STATE EXIT LINES)], \@rows);
+
+    return 0;
+}
+
+sub cmd_log {
+    my @args = @_;
+
+    my ($follow, $limit);
+    GetOptionsFromArray(\@args, 'follow|f' => \$follow, 'limit=i' => \$limit)
+        or die "bad options for log\n";
+
+    my $runid = shift @args or die "usage: proxmod-cronctl log <runid>\n";
+
+    my $run = ProxmodCron::Runs::get($runid);
+
+    my $cursor;
+    my $seen = 0;
+
+    while (1) {
+        my $page = ProxmodCron::Runs::output($runid, cursor => $cursor, limit => $limit);
+
+        for my $line (@{ $page->{lines} }) {
+            $seen++;
+            my $mark = ($line->{stream} || '') eq 'stderr' ? 'E' : ' ';
+            print "$mark $line->{text}\n";
+        }
+
+        $cursor = $page->{cursor} if defined $page->{cursor};
+
+        last if !$follow;
+
+        # Following stops when the run has finished and we have caught up:
+        # there will never be another line, and a tail that waited forever for
+        # one would be a hung terminal.
+        $run = ProxmodCron::Runs::get($runid) if !$run || !defined $run->{finished};
+        last if $run && defined $run->{finished} && $page->{done};
+
+        select(undef, undef, undef, 2);
+    }
+
+    if (!$seen) {
+        # The two ways this is empty are worth telling apart: a run that printed
+        # nothing is fine, and a run whose entries journald has rotated away is
+        # not something the administrator should read as "it was quiet".
+        print $run
+            ? "no output recorded for this run\n"
+            : "this run is no longer in the journal\n";
+    }
+
+    return 0;
+}
+
+sub cmd_inventory {
+    my @args = @_;
+
+    GetOptionsFromArray(\@args) or die "bad options for inventory\n";
+
+    my $entries = ProxmodCron::Inventory::collect();
+
+    my @rows = map {
+        [
+            $_->{source},
+            $_->{owner},
+            $_->{user} || '-',
+            $_->{schedule} || '-',
+            substr($_->{command} || '', 0, 60),
+            $_->{note} || $_->{schedule_error} || '',
+        ];
+    } @$entries;
+
+    table([qw(SOURCE OWNER USER SCHEDULE COMMAND NOTE)], \@rows);
+
+    return 0;
+}
+
+sub cmd_reindex {
+    my @args = @_;
+
+    my $since;
+    GetOptionsFromArray(\@args, 'since=s' => \$since) or die "bad options for reindex\n";
+
+    # Rebuilt from journald, which is the store of record. This is the command
+    # that makes §5.5's claim true: deleting the cache costs a reindex and
+    # nothing else.
+    my $runs = ProxmodCron::Runs::list(since => $since || '-30d', limit => 5000);
+
+    my %newest;
+
+    for my $run (@$runs) {
+        next if !defined $run->{job} || !defined $run->{scope};
+
+        my $key = ProxmodCron::State::key($run->{scope}, $run->{job});
+
+        my $have = $newest{$key};
+        next if $have && ($have->{started} || 0) >= ($run->{started} || 0);
+
+        $newest{$key} = $run;
+    }
+
+    my %cache;
+
+    for my $key (sort keys %newest) {
+        my $run = $newest{$key};
+
+        my $record = {
+            run => $run->{run},
+            job => $run->{job},
+            scope => $run->{scope},
+            started => $run->{started},
+            finished => $run->{finished},
+            exit => $run->{exit},
+            signal => $run->{signal},
+            duration_ms => $run->{duration_ms},
+            lines => $run->{lines} || 0,
+            truncated => $run->{truncated} ? 1 : 0,
+            state => $run->{state},
+            tail => output_tail($run->{run}),
+        };
+
+        delete $record->{$_} for grep { !defined $record->{$_} } keys %$record;
+
+        $cache{$key} = $record;
+    }
+
+    ProxmodCron::State::replace(\%cache);
+
+    printf("rebuilt %d record%s from the journal\n",
+        scalar(keys %cache), (keys(%cache) == 1 ? '' : 's'));
+
+    return 0;
+}
+
+# The last few lines of a run, in the same form proxmod-cron-exec keeps them, so
+# a rebuilt cache is the cache the wrapper would have written.
+#
+# One knowing difference: on a run that hit the line cap, the wrapper journalled
+# a truncation notice but kept it out of its own tail, so a rebuilt tail can
+# carry that notice where the original did not. It only affects runs already
+# flagged `truncated`, and the alternative — recognising the notice by its
+# message text — would be a worse thing to depend on than a one-line difference
+# in a tooltip.
+sub output_tail {
+    my ($runid) = @_;
+
+    my $page = ProxmodCron::Runs::output($runid, limit => $ProxmodCron::State::TAIL_LINES);
+
+    return [map { ($_->{stream} || 'stdout') . ': ' . $_->{text} } @{ $page->{lines} }];
+}
+
+sub cmd_doctor {
+    my @args = @_;
+
+    GetOptionsFromArray(\@args) or die "bad options for doctor\n";
+
+    my @errors;
+    my @warnings;
+    my @notes;
+
+    # 0. A plugin that failed to load takes every job of its type with it.
+    push @errors, "a job type plugin failed to load: $_" for @PLUGIN_ERRORS;
+
+    # 1. Can anything run at all.
+    my $anchor = ProxmodCron::Config::cron_d() . '/proxmod-cron';
+    push @errors, "the anchor $anchor is missing: nothing will be rendered or run"
+        if !-f $anchor;
+
+    # 2. The generated files, and the three ways cron ignores one silently.
+    for my $scope (@{ ProxmodCron::Config::scopes() }) {
+        my $path = ProxmodCron::Render::path($scope);
+        next if !-e $path;
+
+        my $mode = (stat($path))[2] & 07777;
+        push @errors, sprintf('%s is mode %04o: cron ignores a group- or'
+            . ' world-writable file in /etc/cron.d', $path, $mode)
+            if $mode & 0022;
+
+        my ($name) = ($path =~ m{([^/]+)\z});
+        push @errors, "$path contains a '.': cron ignores the whole file"
+            if $name =~ /\./;
+    }
+
+    # 3. Drift: someone edited a generated file, and the next sync will silently
+    #    overwrite them.
+    my $nodename = ProxmodCron::Sync::nodename();
+    for my $scope (@{ ProxmodCron::Config::scopes() }) {
+        my $store = ProxmodCron::Config::load($scope);
+
+        push @errors, "the $scope store cannot be read: $store->{error}"
+            if $store->{error};
+
+        my $text = ProxmodCron::Render::render($scope, $store, $nodename);
+        my $current = read_file(ProxmodCron::Render::path($scope));
+
+        push @warnings, ProxmodCron::Render::path($scope)
+            . ' differs from what would be rendered; the next sync will overwrite it'
+            if (defined($current) ? $current : '') ne (defined($text) ? $text : '');
+    }
+
+    # 4. Jobs whose plugin is not loaded render as comments and do not run.
+    for my $scope (@{ ProxmodCron::Config::scopes() }) {
+        my $store = ProxmodCron::Config::load($scope);
+
+        for my $id (sort keys %{ $store->{jobs} || {} }) {
+            my $job = ProxmodCron::Config::effective($scope, $store, $id);
+
+            push @errors, "$scope job '$id' has type '$job->{type}', which is not"
+                . ' registered: it renders as a comment and will not run'
+                if !ProxmodCron::Registry::lookup($job->{type});
+
+            # 5. The MAILTO/track interaction. Every generated file sets MAILTO
+            #    empty because the wrapper captures output instead; a job that
+            #    opted out of the wrapper under that MAILTO throws its output
+            #    away entirely, which is almost always a mistake.
+            push @warnings, "$scope job '$id' is not tracked and the store's MAILTO"
+                . ' is empty, so anything it prints is discarded'
+                if !$job->{track} && (!defined $store->{mailto} || $store->{mailto} eq '');
+        }
+    }
+
+    # 6. Whether any of this history survives a reboot.
+    if (ProxmodCron::Runs::persistent()) {
+        push @notes, 'journald is storing to disk, so run history survives a reboot';
+    } else {
+        push @warnings, '/var/log/journal does not exist, so journald is volatile'
+            . ' and all run history is lost at reboot (create it, or set'
+            . ' Storage=persistent, on the host — this package will not)';
+    }
+
+    # 7. Rate limiting, which drops entries rather than delaying them — and the
+    #    entry it drops may be the finish record.
+    my $limits = journald_rate_limit();
+    push @notes, "journald rate limit: $limits" if defined $limits;
+
+    push @notes, 'journald is reachable at ' . $ProxmodCron::Journal::SOCKET_PATH
+        if -S $ProxmodCron::Journal::SOCKET_PATH;
+    push @warnings, 'no journald socket at ' . $ProxmodCron::Journal::SOCKET_PATH
+        . ': run records fall back to logger and then to cron mail'
+        if !-S $ProxmodCron::Journal::SOCKET_PATH;
+
+    print "ERROR    $_\n" for @errors;
+    print "WARNING  $_\n" for @warnings;
+    print "ok       $_\n" for @notes;
+
+    print "ok       nothing to report\n" if !@errors && !@warnings && !@notes;
+
+    return @errors ? 1 : 0;
+}
+
+sub journald_rate_limit {
+    my $etc = ProxmodCron::Config::prefix() . '/etc/systemd';
+
+    my @files = ("$etc/journald.conf");
+
+    if (opendir(my $dh, "$etc/journald.conf.d")) {
+        # readdir results are tainted, and this reaches an open(). Matched and
+        # rebuilt rather than filtered.
+        my @drop = sort map { /\A([\w.-]+\.conf)\z/ ? $1 : () } readdir($dh);
+        closedir($dh);
+        push @files, "$etc/journald.conf.d/$_" for @drop;
+    }
+
+    my %setting;
+
+    for my $file (@files) {
+        my $text = read_file($file);
+        next if !defined $text;
+
+        for my $line (split(/\n/, $text)) {
+            next if $line =~ /\A\s*[#;]/;
+            next if $line !~ /\A\s*(RateLimit(?:Burst|IntervalSec))\s*=\s*(\S+)/;
+            $setting{$1} = $2;
+        }
+    }
+
+    return undef if !%setting;
+
+    return join(', ', map { "$_=$setting{$_}" } sort keys %setting);
+}
+
+sub read_file {
+    my ($path) = @_;
+
+    open(my $fh, '<', $path) or return undef;
+    binmode($fh);
+    local $/;
+    my $text = <$fh>;
+    close($fh);
+
+    return defined($text) ? $text : '';
+}

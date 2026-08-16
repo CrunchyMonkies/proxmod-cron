@@ -1,0 +1,4 @@
+# A file cron ignores entirely, because its name contains a dot. This is the
+# quietest failure in cron: no error, no log line, the job simply never runs.
+# Listing it with a note is the whole reason the inventory view exists.
+9 *	* * *	root	[ -x /usr/lib/php/sessionclean ] && /usr/lib/php/sessionclean

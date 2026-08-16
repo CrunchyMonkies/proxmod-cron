@@ -1,0 +1,167 @@
+name: ci
+
+# Everything here runs on a plain Debian container with no Proxmox on it, which
+# is a property of the code rather than a limitation of CI: only
+# ProxmodCron::API2::* touches PVE at all, and t/lib holds stubs for the parts
+# of it those modules use. Everything the cron side runs — the config stores,
+# the renderer, the spec parser, the journal writer, the run wrapper — is
+# PVE-free by design, because it is executed from cron under a bare perl.
+#
+# The claims that can only be made about a live hypervisor are in the plan's
+# verification list and are made by hand on a test host.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install test dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            perl libtest-simple-perl make
+          useradd -m ci
+          chown -R ci:ci .
+
+      # PROXMOD_CRON_TEST_PREFIX — what the sync, exec and cronctl tests use to
+      # redirect every path into a disposable tree — is honoured only when the
+      # effective UID is not 0, so that the override cannot be turned against a
+      # production path as root. Running the suite as real root would silently
+      # fall through to /etc/cron.d and /var/lib, so it runs as a real non-root
+      # user instead.
+      - name: prove -r t/
+        run: su ci -c 'umask 022 && prove -r t/'
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install linters
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            perl nodejs make
+
+      # `make lint` compiles every module and script under -T as well as
+      # plainly. Taint mode is not optional: /usr/bin/pveproxy is
+      # `#!/usr/bin/perl -T` [PVE-F-002], so code that only compiles without it
+      # would fail on a real host and nowhere else.
+      - name: make lint
+        run: make lint
+
+  package:
+    name: build the package
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential debhelper devscripts lintian perl fakeroot
+          useradd -m ci
+          chown -R ci:ci .
+          chown ci:ci ..
+
+      # Rules-Requires-Root: no in debian/control means this package is built by
+      # a non-root user, with fakeroot faking root only where dpkg needs it.
+      # Building as real root here would never exercise that.
+      - name: dpkg-buildpackage
+        run: su ci -c 'dpkg-buildpackage -us -uc -b'
+
+      # Informational. lintian has opinions about a package that ships perl
+      # modules outside a MakeMaker layout and scripts under /usr/lib, and a
+      # failing gate nobody can satisfy gets disabled rather than fixed.
+      - name: lintian
+        run: lintian ../proxmod-cron_*_all.deb || true
+
+      # This package is not standalone and must refuse to install without the
+      # framework it extends. The dependency is expressed in debian/control,
+      # where apt enforces it; asserting it here is what stops it being dropped
+      # silently in a future edit.
+      - name: the package depends on proxmod
+        run: |
+          set -e
+          deb=$(ls ../proxmod-cron_*_all.deb | head -1)
+          dpkg -I "$deb" | grep -E 'Depends:.*proxmod \(>= 0\.2\.0\)'
+
+      # One conffile, and it is the anchor. Anything else under /etc appearing
+      # here means a generated file has been packaged by mistake — and a
+      # generated cron file shipped as a conffile would prompt the
+      # administrator to resolve a "local edit" on every upgrade, for a file
+      # proxmod-cron-sync rewrites on its own.
+      - name: exactly one conffile
+        run: |
+          set -e
+          deb=$(ls ../proxmod-cron_*_all.deb | head -1)
+          dpkg -e "$deb" /tmp/ctrl
+          expected="/etc/cron.d/proxmod-cron"
+          actual=$(cat /tmp/ctrl/conffiles)
+          if [ "$actual" != "$expected" ]; then
+            echo "conffiles is '$actual', expected '$expected'" >&2
+            exit 1
+          fi
+
+      # The anchor is the whole convergence mechanism. cron silently ignores a
+      # cron.d file it cannot parse, and the failure mode is that nothing ever
+      # syncs and nothing ever says why — so the line is checked for the shape
+      # cron requires: five schedule fields, then a user, then a command.
+      - name: the anchor is a valid cron.d line
+        run: |
+          set -e
+          awk '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*$/ { next }
+            /^[A-Za-z_][A-Za-z0-9_]*=/ { next }
+            { entries++; if (NF < 7) { print "too few fields: " $0 > "/dev/stderr"; bad++ } }
+            END {
+              if (entries != 1) { print "expected exactly one cron entry, found " entries > "/dev/stderr"; exit 1 }
+              if (bad) { exit 1 }
+            }
+          ' cron/proxmod-cron
+          # A dot in the filename makes run-parts and cron skip the file
+          # entirely, without a word in any log.
+          case "proxmod-cron" in *.*) echo "cron.d filename contains a dot" >&2; exit 1;; esac
+
+      # The rendered crontab lines name this path literally. If the Makefile
+      # ever moves the wrapper, every tracked job on every installed host runs
+      # a command that does not exist — once a minute, forever.
+      - name: the run wrapper is installed where the renderer points
+        run: |
+          set -e
+          deb=$(ls ../proxmod-cron_*_all.deb | head -1)
+          path=$(perl -ne 'print "$1\n" if m{\x27(/usr/lib/proxmod-cron/[^\x27]+)\x27}' perl/ProxmodCron/Render.pm | head -1)
+          test -n "$path"
+          dpkg -c "$deb" | grep -q " \.${path}$"
+
+      # actions/upload-artifact rejects glob patterns containing a '..' segment
+      # outright, and dpkg-buildpackage always puts its .deb one directory above
+      # the source tree — so the artifact has to be collected into the workspace
+      # before it can be uploaded.
+      - name: collect artifacts
+        run: |
+          mkdir -p dist
+          cp ../proxmod-cron_*_all.deb dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs
+          path: dist/*_all.deb
+          if-no-files-found: error
