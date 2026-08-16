@@ -12,6 +12,10 @@
 #   /etc/pve/proxmod/cron.cfg  cluster configuration, replicated. Purging one
 #                              node of a cluster must not delete the cluster's
 #                              data out from under the others.
+#   /etc/pve/proxmod/cron-lease  the run claims for `run_on: any` jobs, also
+#                              replicated, also not this node's to delete, and
+#                              still the record of which node ran what. The
+#                              remaining nodes keep pruning them as they run.
 #   the journal                run history and captured output are the evidence
 #                              of what ran on this host. A package purge has no
 #                              business vacuuming the host's logs.

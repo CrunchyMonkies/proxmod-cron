@@ -171,10 +171,23 @@ sub render_job {
     return @out;
 }
 
-=head2 wrap($job, $argv)
+=head2 wrap($job, $argv, %opts)
 
 The argv cron actually runs: the job's own command, inside the run wrapper when
-the job is tracked.
+anything at all has to happen around it.
+
+Two things put a job in the wrapper. Tracking, which is what it was built for.
+And the cluster scope, which needs the quorum guard and possibly the tick lease —
+decisions that can only be made at fire time, on the node that is about to run,
+and so cannot live in a rendered file.
+
+An untracked cluster job therefore gains a wrapper it did not have before, but
+with C<--no-record>: it is guarded, and otherwise runs exactly as it used to,
+with no run lock and no history.
+
+C<manual =E<gt> 1> omits C<--once>. C<proxmod-cronctl run> passes it, because an
+operator who names a node and a moment has already made the choice the lease
+exists to make, and must not lose a race to a scheduled tick.
 
 Shared with C<proxmod-cronctl run> so that running a job by hand runs the same
 thing the schedule does — including the tracking, which is what puts a manual
@@ -183,9 +196,11 @@ run in the same history as a scheduled one.
 =cut
 
 sub wrap {
-    my ($job, $argv) = @_;
+    my ($job, $argv, %opts) = @_;
 
-    return [@$argv] if !$job->{track};
+    my $cluster = ($job->{scope} || '') eq 'cluster';
+
+    return [@$argv] if !$job->{track} && !$cluster;
 
     my @wrapper = ($EXEC, $job->{scope}, $job->{id});
     push @wrapper, '--no-output' if !$job->{keep_output};
@@ -195,6 +210,18 @@ sub wrap {
     # produced this line. A store read would label a run with a type the argv
     # does not match, in the window between an edit and the next sync.
     push @wrapper, '--type', $job->{type} if defined $job->{type};
+
+    if ($cluster) {
+        push @wrapper, '--require-quorum';
+
+        # The schedule travels on the line for the same reason the type does: the
+        # tick both nodes race for has to be derived from the definition that
+        # produced this line, not from whatever the store says a minute later.
+        push @wrapper, '--once', '--schedule', $job->{schedule}
+            if ($job->{run_on} || 'all') eq 'any' && !$opts{manual};
+    }
+
+    push @wrapper, '--no-record' if !$job->{track};
 
     return [@wrapper, '--', @$argv];
 }
@@ -281,6 +308,7 @@ sub summary {
         $row->{owner} = $job->{owner} if defined $job->{owner};
         $row->{comment} = $job->{comment} if defined $job->{comment};
         $row->{nodes} = $job->{nodes} if defined $job->{nodes};
+        $row->{run_on} = $job->{run_on} if defined $job->{run_on};
 
         $row->{renders} = ($scope eq 'node'
             || ProxmodCron::Config::targets_node($job, $nodename)) ? 1 : 0;

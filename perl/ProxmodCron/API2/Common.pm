@@ -8,6 +8,7 @@ use PVE::JSONSchema qw(get_standard_option);
 use PVE::RPCEnvironment;
 
 use ProxmodCron::Config;
+use ProxmodCron::Lease;
 use ProxmodCron::Registry;
 use ProxmodCron::Spec;
 use ProxmodCron::State;
@@ -374,6 +375,15 @@ sub job_view {
     # disabled comment line, and the grid should not show it as healthy.
     $row{type_available} = ProxmodCron::Registry::lookup($job->{type}) ? 1 : 0;
 
+    # Which node last claimed a scheduled run, for the jobs where that is a
+    # question at all. Not gated on `status`: it is placement, not history —
+    # available on every node from /etc/pve, and the same answer everywhere,
+    # which is exactly what a per-node run record cannot be.
+    if (($job->{run_on} || '') eq 'any') {
+        my $holder = ProxmodCron::Lease::latest($job->{id});
+        $row{last_holder} = $holder if $holder;
+    }
+
     if ($opts{status}) {
         my $record = ProxmodCron::State::get($job->{scope}, $job->{id});
 
@@ -496,6 +506,16 @@ sub job_properties {
             type => 'array',
             items => { type => 'string', maxLength => 63 },
             description => 'Which nodes render this job. Absent means every node.',
+            optional => 1,
+        };
+        $props{run_on} = {
+            type => 'string',
+            enum => ['all', 'any'],
+            description => 'all: every targeted node runs the job, each on its own'
+                . ' schedule. any: exactly one targeted node runs it per scheduled'
+                . ' time, chosen by racing for a lease, so the job moves to a'
+                . ' surviving node when its usual one is down. any requires'
+                . ' track: true, user root, and a real schedule.',
             optional => 1,
         };
     }

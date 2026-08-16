@@ -34,6 +34,18 @@ our $NODE_FILE = "$PREFIX/etc/proxmod/cron.cfg";
 our $STATE_DIR = "$PREFIX/var/lib/proxmod/cron";
 our $CRON_D = "$PREFIX/etc/cron.d";
 
+# The pmxcfs mount point and the two things under it that are not the store.
+#
+# They are named here rather than in the modules that use them for the same
+# reason every other path is: one place decides, so the test prefix applies to
+# all of them and a production path cannot be spelled out a second time slightly
+# differently. PVE_DIR itself matters because its existence — not the
+# readability of anything inside it — is how ProxmodCron::Cluster tells a host
+# with no cluster filesystem from one whose /etc/pve it may not enter.
+our $PVE_DIR = "$PREFIX/etc/pve";
+our $MEMBERS_FILE = "$PVE_DIR/.members";
+our $LEASE_DIR = "$PVE_DIR/proxmod/cron-lease";
+
 our $STORE_VERSION = 1;
 
 # The registry cannot compute this itself — it is loaded before this module and
@@ -84,6 +96,19 @@ whether the override is honoured.
 sub prefix { return $PREFIX }
 
 sub state_dir { return $STATE_DIR }
+
+=head2 pve_dir() / members_file() / lease_dir()
+
+The cluster filesystem, the membership file pmxcfs publishes, and the root of
+the per-tick lease tree used by C<run_on: any> jobs.
+
+=cut
+
+sub pve_dir { return $PVE_DIR }
+
+sub members_file { return $MEMBERS_FILE }
+
+sub lease_dir { return $LEASE_DIR }
 
 =head2 job_lock_path($scope, $id)
 
@@ -267,10 +292,19 @@ sub _untaint_job {
         $out{nodes} = \@nodes;
     }
 
+    # 'all' is the absent value as well as the default, so a store written by an
+    # older version reads back as exactly what it meant.
+    if (defined $cfg->{run_on}) {
+        my ($run_on) = ((ref($cfg->{run_on}) ? '' : $cfg->{run_on}) =~ /\A(all|any)\z/);
+        return undef if !defined $run_on;
+        $out{run_on} = $run_on;
+    }
+
     # Type-specific keys. The plugin's schema decides what they mean; this only
     # decides that they cannot carry a NUL or a newline into an argv.
     my %known = map { $_ => 1 } qw(
         type schedule origin owner user comment enabled track keep_output nodes
+        run_on
     );
 
     for my $key (sort keys %$cfg) {
@@ -362,6 +396,8 @@ sub validate_job {
         }
     }
 
+    push @errors, @{ _validate_run_on($cfg, %opts) } if defined $cfg->{run_on};
+
     push @errors, "'origin' is set by the server and cannot be supplied"
         if $cfg->{origin} && !$opts{allow_origin};
 
@@ -370,6 +406,68 @@ sub validate_job {
     }
 
     return \@errors;
+}
+
+# What 'run_on: any' needs, each refused with the reason rather than just the
+# rule. They are all surprising, and an administrator who is told
+# "run_on: any needs user: root" and nothing else has to go and find out why.
+#
+# The defaults matter here: a job that says nothing about track or user still
+# has an effective value for both, and checking only what was written would let
+# a job through whose type defaults to track: false.
+sub _validate_run_on {
+    my ($cfg, %opts) = @_;
+
+    my $run_on = ref($cfg->{run_on}) ? '' : $cfg->{run_on};
+
+    return ["'run_on' must be 'all' or 'any'"]
+        if $run_on ne 'all' && $run_on ne 'any';
+
+    return [] if $run_on eq 'all';
+
+    my @errors;
+
+    push @errors, "'run_on: any' is only meaningful in the cluster scope"
+        if ($opts{scope} || '') eq 'node';
+
+    my $class = ProxmodCron::Registry::lookup($cfg->{type});
+
+    push @errors, "'run_on: any' needs track: true, because the run record is the"
+        . ' only thing that says which node ran it'
+        if !_track_for($cfg, $class);
+
+    push @errors, "'run_on: any' needs user: root, because claiming the lease is a"
+        . ' write inside /etc/pve and no other user may make one'
+        if _user_for($cfg, $class) ne 'root';
+
+    # A bad schedule is already reported by the caller; saying so twice helps
+    # nobody. @reboot is a valid schedule and still cannot work here: there is no
+    # scheduled time for two nodes to agree on, so both would run it.
+    my $parsed = eval { ProxmodCron::Spec::parse($cfg->{schedule}) };
+    push @errors, "'run_on: any' needs a real schedule: \@reboot has no scheduled"
+        . ' time for the nodes to agree on, so every node would run it'
+        if $parsed && $parsed->{reboot};
+
+    return \@errors;
+}
+
+# The effective value of the two keys whose default comes from the job type.
+# Shared by effective() and the run_on rules above so the two cannot disagree
+# about what an absent key means.
+sub _track_for {
+    my ($cfg, $class) = @_;
+
+    return $cfg->{track} ? 1 : 0 if defined $cfg->{track};
+
+    return ($class && !$class->track_default()) ? 0 : 1;
+}
+
+sub _user_for {
+    my ($cfg, $class) = @_;
+
+    return $cfg->{user} if $cfg->{user};
+
+    return $class ? $class->run_as() : 'root';
 }
 
 =head2 save($scope, $store)
@@ -469,6 +567,17 @@ sub _slurp {
     return defined($content) ? $content : '';
 }
 
+=head2 write_atomic($path, $content, $mode)
+
+Write a file by creating a temporary beside it and renaming over the target, so
+a reader never sees a half-written file and a crash never leaves one behind.
+Public because ProxmodCron::Cluster writes its cache the same way and a second
+implementation of this is a second thing to get subtly wrong.
+
+=cut
+
+sub write_atomic { return _write_atomic(@_) }
+
 sub _write_atomic {
     my ($path, $content, $mode) = @_;
 
@@ -532,14 +641,20 @@ sub effective {
         scope => $scope,
         origin => $cfg->{origin} || 'user',
         enabled => defined($cfg->{enabled}) ? ($cfg->{enabled} ? 1 : 0) : 1,
-        user => $cfg->{user} || ($class ? $class->run_as() : 'root'),
+        user => _user_for($cfg, $class),
     );
 
-    $job{track} = defined($cfg->{track})
-        ? ($cfg->{track} ? 1 : 0)
-        : ($class ? ($class->track_default() ? 1 : 0) : 1);
+    $job{track} = _track_for($cfg, $class);
 
     $job{keep_output} = defined($cfg->{keep_output}) ? ($cfg->{keep_output} ? 1 : 0) : 1;
+
+    # Cluster only, and absent means 'all' — which is what every job written
+    # before this key existed meant and still means. A node-scoped job has no
+    # run_on at all rather than a defaulted one: there is nothing for it to
+    # choose between, and an inert field in every node job's API row would only
+    # invite somebody to set it.
+    $job{run_on} = (($cfg->{run_on} || '') eq 'any') ? 'any' : 'all'
+        if $scope eq 'cluster';
 
     return \%job;
 }
@@ -550,6 +665,10 @@ Whether a cluster job renders on this node. An absent or empty C<nodes> list, or
 one containing 'all', means every node — the permissive reading, because a
 cluster job with no targeting is the common case and should not silently run
 nowhere.
+
+This is about B<rendering>, not about running. A C<run_on: any> job renders on
+every node it targets and then races for the tick lease at fire time, so this
+answers "may this node be a candidate", not "will this node run it".
 
 =cut
 

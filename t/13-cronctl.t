@@ -16,8 +16,10 @@ BEGIN {
 use File::Path ();
 use JSON::PP ();
 
+use ProxmodCron::Cluster;
 use ProxmodCron::Config;
 use ProxmodCron::Journal;
+use ProxmodCron::Lease;
 use ProxmodCron::Render;
 use ProxmodCron::State;
 
@@ -29,7 +31,7 @@ use ProxmodCron::State;
 # Every seam it needs is the same root-guarded environment override the rest of
 # the suite uses: the config prefix, the journal socket, and journalctl itself.
 
-plan tests => 10;
+plan tests => 13;
 
 my $ROOT = ProxmodCron::Config::prefix();
 my $CTL = "$FindBin::Bin/../exec/proxmod-cronctl";
@@ -488,6 +490,159 @@ subtest 'doctor finds the things that break cron and logging silently' => sub {
     store('node', { 'nightly-trim' => $COMMAND_JOB });
     ctl('sync');
     is(ctl('doctor')->{exit}, 0, 'a healthy host exits 0');
+};
+
+subtest 'run by hand takes the node it was told to, and says when it will not' => sub {
+    plan tests => 8;
+
+    wipe();
+    $drain->();
+
+    my $marker = ProxmodCron::Config::state_dir() . '/forced';
+    unlink($marker);
+
+    store('cluster', {
+        'cluster-echo' => { type => 'command', schedule => '@daily',
+            command => ['/bin/sh', '-c', "echo forced > '$marker'"] },
+    });
+
+    # A minority partition. Every cluster job stands down here, including one
+    # started by hand — the operator's shell is inside the half of the cluster
+    # that cannot see the other half.
+    ProxmodCronTest::cluster_members(nodename => 'pve3', quorate => 0,
+        nodes => { pve1 => 0, pve2 => 0, pve3 => 1 });
+
+    my $blocked = ctl('run', 'cluster-echo', '--scope', 'cluster');
+
+    is($blocked->{exit}, 0, 'the manual run exits cleanly');
+    like($blocked->{out}, qr/--require-quorum/, 'the guard is visible in the argv it shows');
+    ok(!-e $marker, 'and the job did not run');
+
+    # There is one honest use for --force: a node that is deliberately isolated.
+    # It is spelled out rather than assumed, because on a split cluster it is
+    # exactly how the same job ends up running in both halves.
+    my $forced = ctl('run', 'cluster-echo', '--scope', 'cluster', '--force');
+
+    is($forced->{exit}, 0, '--force runs it anyway');
+    unlike($forced->{out}, qr/--require-quorum/, 'with the guard dropped from the argv');
+    is(ProxmodCronTest::slurp($marker), "forced\n", 'and the job really ran');
+
+    # A manual run must never lose a race to a scheduled tick on another node:
+    # the operator picked this node and this moment, which is the choice the
+    # lease exists to make.
+    store('cluster', {
+        'cluster-once' => { type => 'command', schedule => '30 2 * * *',
+            run_on => 'any', command => ['/bin/true'] },
+    });
+    ProxmodCronTest::cluster_members();
+
+    my $once = ctl('run', 'cluster-once', '--scope', 'cluster');
+    unlike($once->{out}, qr/--once/, 'a manual run never claims a tick');
+    is($once->{exit}, 0, 'and runs');
+
+    unlink($marker);
+};
+
+subtest 'leases show where a job that moves has actually been running' => sub {
+    plan tests => 7;
+
+    wipe();
+    File::Path::remove_tree(ProxmodCron::Config::lease_dir(), { safe => 0 });
+    ProxmodCronTest::cluster_members();
+
+    is(ctl('leases')->{out}, "no cluster jobs use run_on: any\n",
+        'a cluster with no moving jobs says so rather than printing an empty table');
+
+    store('cluster', {
+        'moves' => { type => 'command', schedule => '*/5 * * * *',
+            run_on => 'any', command => ['/bin/true'] },
+        'everywhere' => { type => 'command', schedule => '@daily',
+            command => ['/bin/true'] },
+    });
+
+    like(ctl('leases')->{out}, qr/no run has been claimed yet/,
+        'a job that has never fired says that, rather than nothing at all');
+
+    my $tick = 1_800_000_000;
+    ProxmodCron::Lease::acquire('moves', $tick, node => 'pve1', run => 'r-1');
+    ProxmodCron::Lease::note('moves', $tick, { state => 'ok', duration_ms => 1200 });
+    ProxmodCron::Lease::acquire('moves', $tick + 300, node => 'pve2', run => 'r-2');
+
+    my $r = ctl('leases');
+
+    is($r->{exit}, 0, 'the command succeeds');
+    like($r->{out}, qr/^JOB\s+SCHEDULED RUN\s+NODE\s+RESULT\s+DURATION/m, 'with a header');
+    like($r->{out}, qr/moves\s+\S+ \S+\s+pve1\s+ok\s+1200 ms/, 'a finished run, and where');
+    like($r->{out}, qr/moves\s+\S+ \S+\s+pve2\s+running/,
+        'and one still in progress, which is what a mid-run death looks like too');
+
+    # run_on: all is not placement, so it has no lease and no row here. Listing
+    # it would suggest one node ran it, which is the opposite of the truth.
+    unlike($r->{out}, qr/everywhere/, 'a job that runs on every node has no lease to show');
+};
+
+subtest 'doctor reports the cluster this node believes it is in' => sub {
+    plan tests => 8;
+
+    wipe();
+    store('cluster', {
+        'moves' => { type => 'command', schedule => '*/5 * * * *',
+            run_on => 'any', command => ['/bin/true'] },
+    });
+    File::Path::remove_tree(ProxmodCron::Config::lease_dir(), { safe => 0 });
+    ctl('sync');
+
+    ProxmodCronTest::cluster_members();
+    like(ctl('doctor')->{out}, qr/^ok .*not clustered.*unconditionally/m,
+        'a standalone host is told its cluster jobs run here regardless');
+
+    ProxmodCronTest::cluster_members(nodename => 'pve1', quorate => 1,
+        nodes => { pve1 => 1, pve2 => 1, pve3 => 0 });
+    my $partial = ctl('doctor');
+    like($partial->{out}, qr/^ok\s+this node is quorate; offline: pve3$/m,
+        'a quorate node names the members that are down');
+
+    ProxmodCronTest::cluster_members(nodename => 'pve3', quorate => 0,
+        nodes => { pve1 => 0, pve2 => 0, pve3 => 1 });
+    my $split = ctl('doctor');
+    like($split->{out}, qr/^ERROR .*not quorate.*stand down/m,
+        'losing quorum is an error, because jobs stop running because of it');
+    is($split->{exit}, 2, 'and it is the exit status a monitoring check reads');
+
+    # The state that is hardest to diagnose from anywhere else: the sync anchor
+    # has stopped, so the cache non-root wrappers read is frozen at whatever it
+    # last saw. Nothing else on the host mentions it.
+    unlink(ProxmodCron::Config::prefix() . '/etc/pve/.members');
+    ProxmodCron::Cluster::cache_write({ known => 1, quorate => 1, standalone => 0,
+        nodename => 'pve1', nodes => { pve1 => { online => 1 } } });
+
+    my $cache = ProxmodCron::Cluster::cache_file();
+    my $raw = ProxmodCronTest::slurp($cache);
+    my $old = time() - $ProxmodCron::Cluster::STALE_AFTER - 60;
+    $raw =~ s/"updated"\s*:\s*\d+/"updated" : $old/;
+    write_file($cache, $raw);
+
+    like(ctl('doctor')->{out}, qr/proxmod-cron-sync is not running on this node/,
+        'a stale membership cache names the thing that has stopped');
+
+    # A tick nobody ever finished. Nothing re-runs it by design, so this warning
+    # is the only place in the package it is ever mentioned.
+    unlink($cache);
+    ProxmodCronTest::cluster_members();
+    ProxmodCron::Lease::acquire('moves', 1_700_000_000, node => 'pve2', run => 'r-9');
+
+    my $stale = ctl('doctor');
+    like($stale->{out}, qr/^WARNING .*'moves' was claimed by pve2 .*never finished/m,
+        'a lease left running is reported');
+    like($stale->{out}, qr/nothing re-runs that run/,
+        'together with the fact that nothing will pick it up');
+
+    ProxmodCron::Lease::note('moves', 1_700_000_000, { state => 'ok' });
+    unlike(ctl('doctor')->{out}, qr/never finished/,
+        'and a finished one is not');
+
+    File::Path::remove_tree(ProxmodCron::Config::lease_dir(), { safe => 0 });
+    ProxmodCronTest::cluster_members();
 };
 
 # A journalctl -o json entry, as ProxmodCron::Runs expects to decode one.

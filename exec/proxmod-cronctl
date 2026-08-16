@@ -6,9 +6,11 @@ use warnings;
 use Getopt::Long qw(GetOptionsFromArray);
 use POSIX ();
 
+use ProxmodCron::Cluster;
 use ProxmodCron::Config;
 use ProxmodCron::Inventory;
 use ProxmodCron::Journal;
+use ProxmodCron::Lease;
 use ProxmodCron::Registry;
 use ProxmodCron::Render;
 use ProxmodCron::Runs;
@@ -39,6 +41,7 @@ my %COMMANDS = (
     log => \&cmd_log,
     inventory => \&cmd_inventory,
     reindex => \&cmd_reindex,
+    leases => \&cmd_leases,
     doctor => \&cmd_doctor,
 );
 
@@ -95,13 +98,18 @@ usage: proxmod-cronctl <command> [options]
   show <id> [--scope S]              one job in full, with its last run
   render [--scope S] [--diff]        what would be written to /etc/cron.d
   validate                           check both stores and every job in them
-  run <id> [--scope S]               run a job now, exactly as cron would
+  run <id> [--scope S] [--force]     run a job now, exactly as cron would
   sync [--dry-run] [--wait]          render and write what changed
   runs <id> [--limit N] [--since T]  run history, newest first
   log <runid> [--follow]             one run's captured output
   inventory                          every cron entry on this host
   reindex                            rebuild the status cache from journald
+  leases [<id>]                      which node ran each run_on:any job, and when
   doctor                             check what silently breaks cron and logging
+
+run --force drops the quorum guard for that one run. Use it only on a node you
+have deliberately isolated: on a split cluster it is how the same job ends up
+running in both halves.
 
 doctor exits 0 when it has nothing to report, 1 when it emitted warnings and 2
 when it emitted errors, so it can be run from a monitoring check directly.
@@ -269,6 +277,19 @@ sub cmd_show {
     printf("%-14s %s\n", 'nodes', join(', ', @{ $job->{nodes} }))
         if $job->{nodes} && @{ $job->{nodes} };
 
+    if ($found eq 'cluster') {
+        printf("%-14s %s\n", 'run on', ($job->{run_on} || 'all') eq 'any'
+            ? 'any (one node per scheduled run)'
+            : 'all (every node it targets)');
+
+        my $latest = ProxmodCron::Lease::latest($job->{id});
+        printf("%-14s %s (%s, %s)\n", 'last holder',
+            (defined $latest->{node} ? $latest->{node} : 'unknown'),
+            (defined $latest->{state} ? $latest->{state} : 'unknown'),
+            stamp($latest->{tick}))
+            if $latest;
+    }
+
     my $argv = eval { ProxmodCron::Registry::build_command($job->{type}, $job) };
     if ($argv) {
         printf("%-14s %s\n", 'command',
@@ -435,8 +456,9 @@ sub cmd_validate {
 sub cmd_run {
     my @args = @_;
 
-    my $scope;
-    GetOptionsFromArray(\@args, 'scope=s' => \$scope) or die "bad options for run\n";
+    my ($scope, $force);
+    GetOptionsFromArray(\@args, 'scope=s' => \$scope, 'force|f' => \$force)
+        or die "bad options for run\n";
 
     my $id = shift @args or die "usage: proxmod-cronctl run <id>\n";
 
@@ -452,7 +474,17 @@ sub cmd_run {
     # Through the wrapper when the job is tracked, so a manual run is recorded
     # in the same history as a scheduled one — and so it takes the same lock,
     # which stops a hand-started run from overlapping a scheduled one.
-    my $cmd = ProxmodCron::Render::wrap($job, $argv);
+    #
+    # manual: an operator naming a job and a node has already made the choice the
+    # tick lease exists to make, so a manual run must not lose a race to a
+    # scheduled tick on another node.
+    my $cmd = ProxmodCron::Render::wrap($job, $argv, manual => 1);
+
+    # --force additionally drops the quorum guard. There is one honest use for
+    # it — running a job by hand on a node that is deliberately isolated — and it
+    # is spelled out rather than assumed, because on a split cluster it is how
+    # you get the same job running in both halves.
+    @$cmd = grep { $_ ne '--require-quorum' } @$cmd if $force;
 
     print "running $found job '$id': "
         . join(' ', map { ProxmodCron::Render::quote($_) } @$cmd) . "\n";
@@ -729,6 +761,11 @@ sub cmd_doctor {
         push @errors, "the $scope store cannot be read: $store->{error}"
             if $store->{error};
 
+        # A cluster file with no cluster filesystem behind it is not drift. Sync
+        # deliberately leaves it alone in that state and lets the wrapper decide
+        # at fire time, so "the next sync will overwrite it" would be wrong.
+        next if $scope eq 'cluster' && !-d ProxmodCron::Config::pve_dir();
+
         my $text = ProxmodCron::Render::render($scope, $store, $nodename);
         my $current = read_file(ProxmodCron::Render::path($scope));
 
@@ -778,6 +815,11 @@ sub cmd_doctor {
         . ': run records fall back to logger and then to cron mail'
         if !-S $ProxmodCron::Journal::SOCKET_PATH;
 
+    # 8. Quorum, which every cluster-scoped job now depends on. This is the
+    #    check that turns "the backup stopped running and nobody knows why" into
+    #    one line.
+    doctor_cluster(\@errors, \@warnings, \@notes);
+
     print "ERROR    $_\n" for @errors;
     print "WARNING  $_\n" for @warnings;
     print "ok       $_\n" for @notes;
@@ -791,6 +833,127 @@ sub cmd_doctor {
     # findings and do not affect the status.
     return 2 if @errors;
     return 1 if @warnings;
+    return 0;
+}
+
+sub doctor_cluster {
+    my ($errors, $warnings, $notes) = @_;
+
+    my $store = ProxmodCron::Config::load('cluster');
+    my $jobs = $store->{jobs} || {};
+
+    my $direct = ProxmodCron::Cluster::membership();
+    my $status = ProxmodCron::Cluster::status();
+
+    if ($status->{standalone}) {
+        push @$notes, 'this node is not clustered, so cluster-scoped jobs run here'
+            . ' unconditionally';
+    } elsif (!$status->{known}) {
+        push @{ %$jobs ? $errors : $warnings },
+            'the cluster state cannot be determined, so every cluster-scoped job'
+            . " will stand down: $status->{reason}";
+    } elsif (!$status->{quorate}) {
+        push @$errors, 'this node is not quorate, so every cluster-scoped job will'
+            . ' stand down until quorum returns';
+    } else {
+        my @offline = sort grep { !$status->{nodes}->{$_}->{online} }
+            keys %{ $status->{nodes} || {} };
+
+        push @$notes, 'this node is quorate'
+            . ($status->{source} eq 'cache' ? ' (from the membership cache)' : '')
+            . (@offline ? '; offline: ' . join(', ', @offline) : '');
+    }
+
+    # The cache is what a wrapper running as a non-root job user reads. When only
+    # root can answer the question, a stale cache is the whole answer for those
+    # jobs — and it goes stale precisely when the sync anchor has stopped, which
+    # is otherwise invisible.
+    if (!$direct->{known}) {
+        my $cached = ProxmodCron::Cluster::cache_load();
+        if (!$cached) {
+            push @$warnings, 'there is no membership cache at '
+                . ProxmodCron::Cluster::cache_file()
+                . ': run proxmod-cronctl sync as root to write one';
+        } else {
+            my $age = time() - $cached->{updated};
+            $age = 0 if $age < 0;
+            push @$warnings, sprintf('the membership cache is %ds old (stale after'
+                . ' %ds): proxmod-cron-sync is not running on this node',
+                $age, $ProxmodCron::Cluster::STALE_AFTER)
+                if $age > $ProxmodCron::Cluster::STALE_AFTER;
+        }
+    }
+
+    # 9. A tick claimed by a node that never came back. Nothing re-runs it by
+    #    design, so this is the only place it is ever mentioned.
+    for my $id (sort keys %$jobs) {
+        my $job = ProxmodCron::Config::effective('cluster', $store, $id);
+        next if !$job || ($job->{run_on} || 'all') ne 'any';
+
+        my $latest = ProxmodCron::Lease::latest($id);
+        next if !$latest || ($latest->{state} || '') ne 'running';
+
+        # One tick's grace: the newest lease being 'running' is the normal state
+        # of a job that is running right now.
+        next if defined $latest->{tick} && (time() - $latest->{tick}) < 120;
+
+        push @$warnings, sprintf("cluster job '%s' was claimed by %s at %s and"
+            . ' never finished; nothing re-runs that run, and the next scheduled'
+            . ' one will be claimed again', $id,
+            (defined $latest->{node} ? $latest->{node} : 'an unknown node'),
+            stamp($latest->{tick}));
+    }
+
+    return;
+}
+
+sub cmd_leases {
+    my @args = @_;
+
+    GetOptionsFromArray(\@args) or die "bad options for leases\n";
+
+    my $only = shift @args;
+
+    my $store = ProxmodCron::Config::load('cluster');
+
+    my @rows;
+
+    for my $id (sort keys %{ $store->{jobs} || {} }) {
+        next if defined $only && $id ne $only;
+
+        my $job = ProxmodCron::Config::effective('cluster', $store, $id);
+        next if !$job;
+        next if ($job->{run_on} || 'all') ne 'any';
+
+        my $ticks = ProxmodCron::Lease::ticks($id);
+
+        if (!@$ticks) {
+            push @rows, [$id, '-', '-', 'no run has been claimed yet', '-'];
+            next;
+        }
+
+        for my $tick (@$ticks) {
+            my $holder = ProxmodCron::Lease::holder($id, $tick) || {};
+
+            push @rows, [
+                $id,
+                stamp($tick),
+                (defined $holder->{node} ? $holder->{node} : 'unknown'),
+                (defined $holder->{state} ? $holder->{state} : 'unknown'),
+                (defined $holder->{duration_ms} ? "$holder->{duration_ms} ms" : '-'),
+            ];
+        }
+    }
+
+    if (!@rows) {
+        print defined($only)
+            ? "no cluster job named '$only' with run_on: any\n"
+            : "no cluster jobs use run_on: any\n";
+        return 0;
+    }
+
+    table(['JOB', 'SCHEDULED RUN', 'NODE', 'RESULT', 'DURATION'], \@rows);
+
     return 0;
 }
 

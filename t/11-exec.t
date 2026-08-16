@@ -14,10 +14,13 @@ BEGIN {
 }
 
 use Fcntl qw(LOCK_EX LOCK_NB);
+use File::Path ();
 use POSIX ();
 
 use ProxmodCron::Config;
 use ProxmodCron::Journal;
+use ProxmodCron::Lease;
+use ProxmodCron::Spec;
 use ProxmodCron::State;
 
 # The run wrapper, end to end, as a real subprocess against a real datagram
@@ -33,7 +36,7 @@ use ProxmodCron::State;
 # PROXMOD_CRON_TEST_SOCKET, honoured only for a non-root process — because a
 # package variable does not cross a fork+exec.
 
-plan tests => 12;
+plan tests => 15;
 
 my $EXEC = "$FindBin::Bin/../exec/proxmod-cron-exec";
 my $PERL_DIR = "$FindBin::Bin/../perl";
@@ -62,6 +65,9 @@ sub run_exec {
     if ($pid == 0) {
         if ($opt{stderr}) {
             open(STDERR, '>', $opt{stderr}) or POSIX::_exit(127);
+        }
+        if ($opt{stdout}) {
+            open(STDOUT, '>', $opt{stdout}) or POSIX::_exit(127);
         }
         my @cmd = ($^X, '-I', $PERL_DIR, $EXEC, @$args);
         { exec { $cmd[0] } @cmd; }
@@ -427,6 +433,133 @@ subtest 'the argv is an argv, and the start record precedes the exec' => sub {
     is($finish->{PROXMOD_CRON_EXIT}, '127', 'and the failure is recorded as a finish');
     ok(scalar(@{ events($result, 'output') }) >= 1,
         "with the exec error itself captured as the job's output");
+};
+
+subtest 'a node that cannot confirm the cluster stands down instead of guessing' => sub {
+    plan tests => 8;
+
+    wipe_state();
+
+    my $marker = ProxmodCron::Config::state_dir() . '/quorum-marker';
+    my $touch = sub { unlink($marker); return perl_job(qq{ open(my \$fh, '>', '$marker'); }) };
+
+    # A standalone host is its own quorum. This is the case that must not fail
+    # closed: refusing here would stop cluster jobs on every unclustered install
+    # in existence, which is most of them.
+    ProxmodCronTest::cluster_members();
+    my $alone = run_exec(['cluster', 'guarded', '--require-quorum', '--', $touch->()]);
+
+    is($alone->{exit}, 0, 'a standalone host runs its cluster jobs');
+    ok(-e $marker, 'the job actually ran');
+
+    # Minority partition. pmxcfs has gone read-only, the other half of the
+    # cluster is still running things, and this node acting on a config it can
+    # no longer confirm is how one backup becomes two.
+    ProxmodCronTest::cluster_members(nodename => 'pve3', quorate => 0,
+        nodes => { pve1 => 0, pve2 => 0, pve3 => 1 });
+    my $lost = run_exec(['cluster', 'guarded', '--require-quorum', '--', $touch->()]);
+
+    # Exit 0: from cron's point of view nothing went wrong. A non-zero exit
+    # would mail the administrator every minute for as long as the split lasts,
+    # which is precisely when they are reading their mail for something else.
+    is($lost->{exit}, 0, 'a non-quorate node exits cleanly');
+    ok(!-e $marker, 'without running the job');
+    like(one_event($lost, 'skipped')->{MESSAGE}, qr/quorate/,
+        'and records why, because a silent skip looks identical to a no-op');
+    is(scalar(@{ events($lost, 'start') }), 0, 'with no start record at all');
+
+    # A node-scoped job on the same host is unaffected: it depends on nothing
+    # outside this machine, and stopping it would turn a cluster problem into a
+    # host problem.
+    my $node = run_exec(['node', 'unguarded', '--', $touch->()]);
+    is($node->{exit}, 0, 'a node job on the same host is untouched');
+    ok(-e $marker, 'and runs');
+
+    unlink($marker);
+    ProxmodCronTest::cluster_members();
+};
+
+subtest 'one tick, one run, wherever in the cluster it lands' => sub {
+    plan tests => 7;
+
+    wipe_state();
+    File::Path::remove_tree(ProxmodCron::Config::lease_dir(), { safe => 0 });
+
+    ProxmodCronTest::cluster_members(nodename => 'pve1', quorate => 1,
+        nodes => { pve1 => 1, pve2 => 1 });
+
+    # Both invocations have to derive the same tick, and the tick is the minute.
+    # Near the boundary they would legitimately be two different scheduled runs,
+    # so wait rather than assert a coin toss.
+    select(undef, undef, undef, 0.2) while (time() % 60) > 50;
+
+    my $marker = ProxmodCron::Config::state_dir() . '/once-marker';
+    unlink($marker);
+
+    my @args = ('cluster', 'once-job', '--require-quorum', '--once',
+        '--schedule', '* * * * *', '--');
+    my @job = perl_job(qq{ open(my \$fh, '>>', '$marker'); print {\$fh} "ran\\n"; });
+
+    my $first = run_exec([@args, @job]);
+    my $second = run_exec([@args, @job]);
+
+    is($first->{exit}, 0, 'the node that wins the lease runs the job');
+    ok(one_event($first, 'finish'), 'and records a complete run');
+
+    is($second->{exit}, 0, 'the node that loses exits cleanly');
+    is(scalar(@{ events($second, 'start') }), 0, 'and does not start the job');
+    like(one_event($second, 'skipped')->{MESSAGE}, qr/already claimed/,
+        'saying the tick was claimed elsewhere');
+
+    is(ProxmodCronTest::slurp($marker), "ran\n",
+        'the job ran exactly once for the scheduled minute');
+
+    # The lease says which node ran it, which is the first question anyone asks
+    # about a job that moves.
+    my $tick = ProxmodCron::Spec::tick('* * * * *');
+    is(ProxmodCron::Lease::holder('once-job', $tick)->{node}, 'pve1',
+        'and the lease records where');
+
+    unlink($marker);
+    ProxmodCronTest::cluster_members();
+};
+
+subtest '--no-record guards the job and otherwise leaves it exactly as it was' => sub {
+    plan tests => 6;
+
+    wipe_state();
+
+    # An untracked cluster job still has to be stopped when the node is not
+    # quorate, so it now goes through the wrapper — but nothing else about it
+    # may change. Its output went to cron's mail before and still does, it took
+    # no run lock before and still does not, and it left no history before.
+    my $out = ProxmodCron::Config::state_dir() . '/unrecorded.txt';
+    unlink($out);
+
+    ProxmodCronTest::cluster_members();
+
+    my $result = run_exec(['cluster', 'untracked', '--require-quorum', '--no-record', '--',
+        perl_job(q{ print "loud\n"; exit(3) })], stdout => $out);
+
+    is($result->{exit}, 3, "the job's exit status is still the wrapper's");
+    is(ProxmodCronTest::slurp($out), "loud\n", 'and its output still goes where it went');
+
+    is(scalar(@{ events($result, 'start') }), 0, 'nothing is journalled as a run');
+    is(scalar(@{ events($result, 'output') }), 0, 'and no output is captured');
+    is(ProxmodCron::State::get('cluster', 'untracked'), undef,
+        'no status record is written for the grid');
+
+    # The lock is the observable half: a job that overlapped itself before must
+    # still be allowed to, or an untracked job silently changes behaviour.
+    my $lock = ProxmodCron::Config::job_lock_path('cluster', 'untracked');
+    ok(!-e $lock || do {
+        open(my $fh, '>>', $lock) or die "cannot open $lock: $!\n";
+        my $free = flock($fh, LOCK_EX | LOCK_NB);
+        close($fh);
+        $free;
+    }, 'and no run lock is held or left behind');
+
+    unlink($out);
 };
 
 subtest 'run ids are unique, and bad arguments are refused' => sub {

@@ -8,14 +8,37 @@ use IO::Select ();
 use POSIX ();
 use Time::HiRes ();
 
+use ProxmodCron::Cluster;
 use ProxmodCron::Config;
 use ProxmodCron::Journal;
+use ProxmodCron::Lease;
+use ProxmodCron::Spec;
 use ProxmodCron::State;
 
-# The run wrapper. Every job with track: true renders through it, and it is the
-# only thing that writes run records.
+# The run wrapper. Every job with track: true renders through it, every
+# cluster-scoped job renders through it, and it is the only thing that writes run
+# records.
 #
-#   proxmod-cron-exec <scope> <jobid> [--no-output] [--type <type>] -- <argv...>
+#   proxmod-cron-exec <scope> <jobid> [--no-output] [--type <type>]
+#                     [--require-quorum] [--once --schedule <spec>] [--no-record]
+#                     -- <argv...>
+#
+# It is also where every decision that can only be made at fire time is made,
+# because a rendered cron file is a statement about the last minute and this runs
+# in this one:
+#
+#   * --require-quorum: a node that cannot confirm the cluster configuration it
+#     is acting on stands down. Every cluster-scoped job gets this.
+#   * --once --schedule: exactly one node in the cluster runs this tick. The
+#     others lose the race and stand down. See ProxmodCron::Lease.
+#   * --no-record: guards only. An untracked cluster job needs the guards and
+#     nothing else, and must otherwise behave exactly as it did unwrapped — no
+#     run lock, no history, output straight through to cron.
+#
+# EVERY STAND-DOWN IS A JOURNAL RECORD, including under --no-record. "It did not
+# run" and "it ran and did nothing" look identical afterwards otherwise, which is
+# the one thing that would make a job that moves between nodes impossible to
+# reason about.
 #
 # Four properties that are easy to get wrong, all of them here:
 #
@@ -57,7 +80,9 @@ exit(main(@ARGV));
 sub main {
     my @args = @_;
 
-    my ($scope, $id, $keep_output, $type, $argv) = parse_args(@args);
+    my $opt = parse_args(@args);
+
+    my ($scope, $id) = ($opt->{scope}, $opt->{id});
 
     # The type comes in on the command line rather than out of the store. The
     # renderer put it there alongside the argv it derived from that same type, so
@@ -66,27 +91,54 @@ sub main {
     my $job = {
         id => $id,
         scope => $scope,
-        type => $type,
+        type => $opt->{type},
     };
 
     load_limits();
 
-    my ($lock, $busy) = take_lock($scope, $id);
-    if ($busy) {
-        # A slow job must not stack up. A recorded skip is far better than a
-        # silent one: "it did not run" and "it ran and did nothing" look
-        # identical afterwards otherwise.
-        ProxmodCron::Journal::send_entry({
-            %{ ProxmodCron::Journal::job_fields($job) },
-            MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{skipped},
-            PROXMOD_CRON_EVENT => 'skipped',
-            PRIORITY => 4,
-            MESSAGE => "skipped $scope job '$id': a previous run is still in progress",
-        });
-        return 0;
+    # Guard order: quorum, then the tick lease, then the run lock. Widest
+    # question first — there is no point racing for a lease inside a partition
+    # we have already established this node should not be acting on.
+    my $cluster;
+    if ($opt->{require_quorum}) {
+        $cluster = ProxmodCron::Cluster::status();
+        my ($ok, $why) = ProxmodCron::Cluster::quorate($cluster);
+        return stand_down($job, $why) if !$ok;
     }
 
     my $run = run_id();
+
+    my $tick;
+    if ($opt->{once}) {
+        $tick = ProxmodCron::Spec::tick($opt->{schedule});
+
+        my ($result, $why) = ProxmodCron::Lease::acquire($id, $tick,
+            node => ProxmodCron::Cluster::nodename($cluster),
+            run => $run,
+        );
+
+        return stand_down($job,
+            "another node has already claimed this run", tick => $tick)
+            if $result eq 'taken';
+
+        return stand_down($job, $why, tick => $tick) if $result ne 'won';
+    }
+
+    # An untracked job takes no run lock, exactly as it took none before the
+    # guards put it in a wrapper. Its overlap behaviour is its own business.
+    my ($lock, $busy) = $opt->{record} ? take_lock($scope, $id) : (undef, 0);
+    if ($busy) {
+        # A slow job must not stack up. A recorded skip is far better than a
+        # silent one.
+        note_lease($id, $tick, { state => 'skipped', finished => time() });
+        return stand_down($job, 'a previous run is still in progress');
+    }
+
+    return run_unrecorded($job, $opt, $tick) if !$opt->{record};
+
+    my $argv = $opt->{argv};
+    my $keep_output = $opt->{keep_output};
+
     my $started = Time::HiRes::time();
 
     ProxmodCron::Journal::send_entry({
@@ -137,6 +189,14 @@ sub main {
         tail => $captured->{tail},
     });
 
+    note_lease($id, $tick, {
+        state => (($signal) ? 'killed' : ($exit == 0 ? 'ok' : 'failed')),
+        finished => int($started) + int($duration_ms / 1000),
+        exit => $exit,
+        signal => $signal,
+        duration_ms => $duration_ms,
+    });
+
     # Re-raise rather than exit. cron decides whether a job succeeded from the
     # wait status, and a SIGKILLed job that exits 0 here would be recorded as a
     # success by every other tool on the host.
@@ -150,11 +210,73 @@ sub main {
     return $exit;
 }
 
+# A stand-down: the job did not run, and the journal says why. Always exit 0 —
+# nothing failed, and telling cron otherwise would mail the administrator about
+# a working cluster every minute.
+sub stand_down {
+    my ($job, $why, %extra) = @_;
+
+    $why = 'no reason given' if !defined $why || $why eq '';
+
+    ProxmodCron::Journal::send_entry({
+        %{ ProxmodCron::Journal::job_fields($job) },
+        MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{skipped},
+        PROXMOD_CRON_EVENT => 'skipped',
+        (defined $extra{tick} ? (PROXMOD_CRON_TICK => $extra{tick}) : ()),
+        PRIORITY => 4,
+        MESSAGE => "skipped $job->{scope} job '$job->{id}': $why",
+    });
+
+    return 0;
+}
+
+sub note_lease {
+    my ($id, $tick, $fields) = @_;
+
+    return if !defined $tick;
+
+    ProxmodCron::Lease::note($id, $tick, $fields);
+
+    return;
+}
+
+# --no-record: the guards ran, and from here the job behaves exactly as it did
+# when it was not wrapped at all. Output goes wherever ours goes, which for cron
+# means the same mail it always did.
+sub run_unrecorded {
+    my ($job, $opt, $tick) = @_;
+
+    my $started = Time::HiRes::time();
+
+    my $status = run_unwatched($opt->{argv});
+
+    my $exit = $status >> 8;
+    my $signal = $status & 127;
+
+    note_lease($job->{id}, $tick, {
+        state => (($signal) ? 'killed' : ($exit == 0 ? 'ok' : 'failed')),
+        finished => int(Time::HiRes::time()),
+        exit => $exit,
+        signal => $signal,
+        duration_ms => int((Time::HiRes::time() - $started) * 1000),
+    });
+
+    if ($signal) {
+        kill($signal, $$);
+        POSIX::_exit(128 + $signal);
+    }
+
+    return $exit;
+}
+
 sub parse_args {
     my @args = @_;
 
-    my ($scope, $id, $type);
+    my ($scope, $id, $type, $schedule);
     my $keep_output = 1;
+    my $require_quorum = 0;
+    my $once = 0;
+    my $record = 1;
     my @argv;
     my $seen_separator = 0;
 
@@ -172,9 +294,30 @@ sub parse_args {
             next;
         }
 
+        if ($arg eq '--require-quorum') {
+            $require_quorum = 1;
+            next;
+        }
+
+        if ($arg eq '--once') {
+            $once = 1;
+            next;
+        }
+
+        if ($arg eq '--no-record') {
+            $record = 0;
+            next;
+        }
+
         if ($arg eq '--type') {
             $type = shift @args;
             usage("--type needs a value") if !defined $type;
+            next;
+        }
+
+        if ($arg eq '--schedule') {
+            $schedule = shift @args;
+            usage("--schedule needs a value") if !defined $schedule;
             next;
         }
 
@@ -203,14 +346,33 @@ sub parse_args {
     my $clean_type;
     ($clean_type) = ($type =~ $ProxmodCron::Config::ID_PATTERN) if defined $type;
 
-    return ($clean_scope, $clean_id, $keep_output, $clean_type, \@argv);
+    # The schedule reaches ProxmodCron::Spec, which is a parser and not an
+    # evaluator, but it also reaches a directory name via the tick it produces.
+    my $clean_schedule;
+    ($clean_schedule) = ($schedule =~ m{\A([\@\w\*/,\- ]{1,128})\z})
+        if defined $schedule;
+
+    usage('--once needs --schedule') if $once && !defined $clean_schedule;
+
+    return {
+        scope => $clean_scope,
+        id => $clean_id,
+        type => $clean_type,
+        keep_output => $keep_output,
+        require_quorum => $require_quorum,
+        once => $once,
+        schedule => $clean_schedule,
+        record => $record,
+        argv => \@argv,
+    };
 }
 
 sub usage {
     my ($why) = @_;
     print STDERR "proxmod-cron-exec: $why\n";
     print STDERR "usage: proxmod-cron-exec <cluster|node> <jobid> [--no-output]"
-        . " [--type <type>] -- <command> [args...]\n";
+        . " [--type <type>] [--require-quorum] [--once --schedule <spec>]"
+        . " [--no-record] -- <command> [args...]\n";
     exit(2);
 }
 

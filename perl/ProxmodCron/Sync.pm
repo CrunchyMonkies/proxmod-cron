@@ -6,7 +6,9 @@ use warnings;
 use Fcntl qw(O_WRONLY O_CREAT O_EXCL LOCK_EX LOCK_NB);
 use POSIX ();
 
+use ProxmodCron::Cluster;
 use ProxmodCron::Config;
+use ProxmodCron::Lease;
 use ProxmodCron::Registry;
 use ProxmodCron::Render;
 use ProxmodCron::State;
@@ -27,10 +29,16 @@ our $VERSION = '0.1.0';
 Render both scopes and write what changed. Options: C<wait> (block for the lock
 instead of skipping), C<dry_run>.
 
-Returns C<< { skipped, changed, results => { $scope => 'written'|'removed'|undef },
+Returns C<< { skipped, changed, results => { $scope =>
+'written'|'removed'|'preserved'|undef }, membership, leases_pruned,
 errors => [...] } >>. Never dies — a failure on one scope must not stop the
 other, because the two stores are independent and a broken cluster file should
 not take this node's own jobs down with it.
+
+Two things happen here besides rendering, both because this is the only part of
+the package that runs as root every minute: the membership cache is refreshed
+for the benefit of wrappers that cannot read /etc/pve themselves, and expired
+tick leases are pruned.
 
 =cut
 
@@ -45,11 +53,16 @@ sub run {
 
     my @errors = ProxmodCron::Registry::load_plugins();
 
-    my $nodename = nodename();
+    # Read once and pass it around: three decisions below depend on it, and they
+    # must all be made about the same instant.
+    my $membership = ProxmodCron::Cluster::membership();
+
+    my $nodename = ProxmodCron::Cluster::nodename($membership);
 
     my %results;
     my $changed = 0;
     my %live;
+    my %cluster_jobs;
 
     for my $scope (@{ ProxmodCron::Config::scopes() }) {
         my $store = ProxmodCron::Config::load($scope);
@@ -58,6 +71,24 @@ sub run {
 
         $live{ ProxmodCron::State::key($scope, $_) } = 1
             for keys %{ $store->{jobs} || {} };
+
+        %cluster_jobs = map { $_ => 1 } keys %{ $store->{jobs} || {} }
+            if $scope eq 'cluster';
+
+        # An empty cluster store because pmxcfs is not mounted is not the same
+        # statement as an empty cluster store. Removing the rendered file here
+        # would make every cluster job vanish from a node that has merely lost
+        # its cluster filesystem — and the wrapper is now the thing that decides
+        # whether such a node may run them, with far fresher information than a
+        # renderer that ran at some point in the last minute.
+        if ($scope eq 'cluster' && !-d ProxmodCron::Config::pve_dir()
+            && -e ProxmodCron::Render::path($scope)) {
+            $results{$scope} = 'preserved';
+            push @errors, 'the cluster filesystem is not mounted: '
+                . ProxmodCron::Render::path($scope)
+                . ' was left as it is, and its jobs will stand down at fire time';
+            next;
+        }
 
         my $text = ProxmodCron::Render::render($scope, $store, $nodename);
         my $path = ProxmodCron::Render::path($scope);
@@ -78,10 +109,27 @@ sub run {
     # existed. It is only an index; losing an entry costs a reindex.
     ProxmodCron::State::prune(\%live);
 
+    # Publish the cluster's state where a wrapper running as a non-root job user
+    # can read it. /etc/pve is 0750 root:www-data, and this is the only part of
+    # the package guaranteed to be root and to run every minute.
+    my $cached;
+    $cached = ProxmodCron::Cluster::cache_write($membership)
+        if !$opts{dry_run};
+
+    # Only when quorate: on a node that has lost quorum every removal fails
+    # anyway, and pruning a lease tree from inside a minority partition is
+    # exactly the wrong instinct.
+    my $pruned;
+    $pruned = eval { ProxmodCron::Lease::prune(\%cluster_jobs) }
+        if !$opts{dry_run} && $membership->{known} && $membership->{quorate};
+
     return {
         skipped => 0,
         changed => $changed,
         results => \%results,
+        membership => $membership,
+        cache => $cached,
+        leases_pruned => $pruned,
         errors => \@errors,
     };
 }
@@ -133,22 +181,13 @@ sub apply {
 
 =head2 nodename()
 
-This node's short name, without loading PVE::INotify. PVE uses the short
-hostname and so do we: a cluster job targeted at 'pve1' has to match what the
-API calls this node.
+This node's short name, without loading PVE::INotify. Kept here as the name
+every caller already uses; the definition moved to ProxmodCron::Cluster when the
+wrapper started needing it too.
 
 =cut
 
-sub nodename {
-    my $name = (POSIX::uname())[1];
-
-    $name = '' if !defined $name;
-    $name =~ s/\..*\z//;
-
-    my ($clean) = ($name =~ /\A([a-zA-Z0-9][a-zA-Z0-9-]{0,62})\z/);
-
-    return $clean;
-}
+sub nodename { return ProxmodCron::Cluster::nodename(@_) }
 
 sub _lock {
     my ($wait) = @_;

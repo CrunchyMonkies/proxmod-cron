@@ -284,7 +284,8 @@ sub validate {
     # Keys every job has, whatever its type. The type's own properties are
     # checked against the schema; these are checked by ProxmodCron::Config.
     my %common = map { $_ => 1 } qw(
-        type origin owner enabled schedule user comment nodes track keep_output
+        type origin owner enabled schedule user comment nodes run_on track
+        keep_output
     );
 
     for my $key (sort keys %$cfg) {

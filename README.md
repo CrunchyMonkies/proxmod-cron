@@ -91,13 +91,14 @@ declares `"requires": ["cron"]` and sits at 50 loads after this one and finds
 | `/etc/cron.d/proxmod-cron-{cluster,node}` | generated — do not edit |
 | `/etc/proxmod/cron.cfg` | node job definitions, mode `0600` |
 | `/etc/pve/proxmod/cron.cfg` | cluster job definitions, replicated |
-| `/var/lib/proxmod/cron/` | locks and the last-run cache — derived only |
+| `/etc/pve/proxmod/cron-lease/` | which node claimed which run of a `run_on: any` job |
+| `/var/lib/proxmod/cron/` | locks, the last-run cache and the membership cache — derived only |
 
 `apt purge` removes the generated cron files, `/var/lib/proxmod/cron` and the
-node store. It deliberately leaves `/etc/pve/proxmod/cron.cfg` alone — that is
-cluster configuration, and purging one node must not delete the cluster's data —
-and it leaves the journal entirely alone, because a package purge has no business
-vacuuming the host's logs.
+node store. It deliberately leaves everything under `/etc/pve/proxmod` alone —
+that is cluster state, and purging one node must not delete it out from under the
+others — and it leaves the journal entirely alone, because a package purge has no
+business vacuuming the host's logs.
 
 ---
 
@@ -116,6 +117,7 @@ vacuuming the host's logs.
       "user": "root",
       "comment": "fstrim all mounts",
       "nodes": ["pve1", "pve2"],
+      "run_on": "all",
       "track": true,
       "keep_output": true,
       "command": ["/usr/sbin/fstrim", "-a"]
@@ -133,6 +135,7 @@ vacuuming the host's logs.
 | `schedule` | 5-field cron spec, or `@hourly` / `@daily` / `@weekly` / `@monthly` / `@yearly` / `@reboot` |
 | `user` | crontab user field, default `root` |
 | `nodes` | cluster store only — which nodes render this job; absent means every node |
+| `run_on` | cluster store only — `all` (default) runs it on every node it targets; `any` runs it on exactly one of them per scheduled run (see below) |
 | `track` | default `true`; wrap in `proxmod-cron-exec` so the run and its output are recorded |
 | `keep_output` | default `true`; when `false`, only start and finish are recorded and the job's output is discarded |
 
@@ -163,6 +166,70 @@ quietly reverted on the next daemon restart.
 An **orphan** — a job whose owning extension is no longer loaded — still renders
 and still runs, and becomes removable. Otherwise uninstalling an extension would
 leave permanently undeletable rows.
+
+### Cluster jobs: replication, placement, and quorum
+
+The cluster store is replicated by pmxcfs, so a job defined once appears on every
+node. What each node then *does* with it is `run_on`:
+
+| `run_on` | |
+|---|---|
+| `all` (default) | every node the job targets runs it, every time. Fan-out work: rotate logs, trim filesystems, collect metrics. |
+| `any` | exactly one node runs it per scheduled run. Work that must happen once somewhere: a backup, a report, a remote sync. |
+
+`nodes` composes with both — `nodes: [a, b]` plus `run_on: any` means one of a
+or b.
+
+**How `any` picks a node.** It doesn't. At the scheduled minute every node that
+targets the job races to `mkdir` one directory in `/etc/pve`, which pmxcfs makes
+an atomic cluster-wide test-and-set. One node creates it and runs the job; the
+rest find it already there, record a skip, and exit 0. There is no leader, no
+heartbeat, and nothing to elect — so there is also nothing to fail over. A node
+that is powered off simply loses the race, and the next scheduled run lands on a
+survivor with no manual action and no reconfiguration.
+
+**It is placement, not load balancing.** Nothing rotates the winner, and on a
+settled cluster the same node tends to win run after run because it is
+consistently first to the filesystem. That is the intended behaviour — the
+guarantee is *once*, not *evenly* — but do not use `run_on: any` expecting the
+work to spread itself across the cluster.
+
+`proxmod-cronctl leases` shows which node claimed each recent run and how it
+ended; the datacenter Cron tab shows the same thing in the **Last claimed by**
+column.
+
+**A node that dies mid-run is not retried.** The run it claimed stays claimed and
+stays marked `running`; nothing re-runs it. That is deliberate: for a backup or a
+migration, running twice is worse than running once and stopping. `doctor`
+reports a claim left `running` so it is visible rather than silent, and the next
+scheduled run proceeds normally on whichever node wins it.
+
+`run_on: any` has four requirements, each refused when the job is written rather
+than discovered at 02:30:
+
+- **the cluster scope** — there is nothing to pick between on a single node;
+- **`track: true`** — the run record is the only thing that says which node ran it;
+- **`user: root`** — claiming a run is a write inside `/etc/pve`, which no other
+  user may make;
+- and **a real schedule** — `@reboot` has no scheduled minute for two nodes to
+  agree on, so every node would run it.
+
+**Quorum applies to every cluster-scoped job, both values of `run_on`.** A node
+that is not quorate cannot confirm the configuration it holds is current — the
+other half of the cluster may have changed or disabled the job — so it stands
+down and records a skip for each one. Node-scoped jobs are untouched: they depend
+on nothing outside that machine. A standalone host is its own quorum and is
+unaffected in every respect.
+
+> **Behaviour change on upgrade.** Before this, a node that lost quorum kept
+> running its cluster jobs, and a partitioned cluster ran every cluster job in
+> both halves. It now stands down instead. If you rely on a job continuing
+> through a partition, move it to the node store, where it is unconditional.
+
+`proxmod-cronctl doctor` reports this node's view of the cluster, including which
+members are offline and whether the membership cache non-root jobs read is fresh.
+`proxmod-cronctl run --force` runs one job by hand with the quorum guard dropped,
+for a node that has been isolated deliberately.
 
 ---
 
@@ -303,14 +370,19 @@ What an administrator uses when the web interface is not reachable.
   show <id> [--scope S]              one job in full, with its last run
   render [--scope S] [--diff]        what would be written to /etc/cron.d
   validate                           check both stores and every job in them
-  run <id> [--scope S]               run a job now, exactly as cron would
+  run <id> [--scope S] [--force]     run a job now, exactly as cron would
   sync [--dry-run] [--wait]          render and write what changed
   runs <id> [--limit N] [--since T]  run history, newest first
   log <runid> [--follow]             one run's captured output
   inventory                          every cron entry on this host
   reindex                            rebuild the status cache from journald
+  leases [<id>]                      which node ran each run_on:any job, and when
   doctor                             check what silently breaks cron and logging
 ```
+
+`run --force` drops the quorum guard for that one run. There is one honest use
+for it — a node you have deliberately isolated — and on a split cluster it is
+how the same job ends up running in both halves.
 
 `doctor` is the one to run first when something is not firing: it checks journal
 persistence and rate limits, `MAILTO` versus `track`, unreadable stores, and

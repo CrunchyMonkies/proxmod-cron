@@ -15,8 +15,12 @@ BEGIN {
 
 use Fcntl qw(LOCK_EX LOCK_NB);
 
+use File::Path ();
+
+use ProxmodCron::Cluster;
 use ProxmodCron::Config;
 use ProxmodCron::JobType::Command;
+use ProxmodCron::Lease;
 use ProxmodCron::Registry;
 use ProxmodCron::Render;
 use ProxmodCron::State;
@@ -36,7 +40,7 @@ use ProxmodCron::Sync;
 # a full run, which is a claim this file can only make honestly because it is
 # not itself a PVE consumer.
 
-plan tests => 11;
+plan tests => 12;
 
 ProxmodCron::Registry::register('ProxmodCron::JobType::Command');
 
@@ -324,6 +328,58 @@ subtest 'the derived cache is pruned to jobs that still exist' => sub {
     ProxmodCron::Sync::run();
     is(ProxmodCron::State::get('node', 'keeper'), undef,
         'and deleting the job drops its record on the next sync');
+};
+
+subtest 'the sync is also the cluster housekeeper, because it is the root one' => sub {
+    plan tests => 8;
+
+    wipe();
+    unlink(ProxmodCron::Cluster::cache_file());
+    File::Path::remove_tree(ProxmodCron::Config::lease_dir(), { safe => 0 });
+
+    ProxmodCronTest::cluster_members(nodename => $NODENAME, quorate => 1,
+        nodes => { $NODENAME => 1, 'pve-other' => 1 });
+
+    ProxmodCronTest::write_store('cluster', store('kept' => cfg(run_on => 'any')));
+
+    # The wrapper may run as a non-root job user, which cannot open /etc/pve at
+    # all. This run — root, every minute — is the only thing that can publish
+    # the cluster's state somewhere such a user can read it.
+    my $result = ProxmodCron::Sync::run();
+
+    is($result->{cache}, 'written', 'the membership cache is written');
+    is(sprintf('%04o', (stat(ProxmodCron::Cluster::cache_file()))[2] & 07777), '0644',
+        'world-readable, which is the whole reason it exists');
+    is(ProxmodCron::Sync::run()->{cache}, undef,
+        'and rewritten only when the cluster says something new');
+
+    # Lease directories accumulate one per tick. A per-minute job would add 1440
+    # a day to a filesystem with a 30 MB ceiling shared with the rest of PVE.
+    my $base = 1_800_000_000;
+    ProxmodCron::Lease::acquire('kept', $base + 60 * $_, node => $NODENAME) for (0 .. 5);
+    ProxmodCron::Lease::acquire('gone', $base, node => $NODENAME);
+
+    ok(ProxmodCron::Sync::run()->{leases_pruned} > 0, 'the lease tree is pruned');
+    is(scalar @{ ProxmodCron::Lease::ticks('kept') }, $ProxmodCron::Lease::KEEP,
+        'to the newest few ticks of each job that still exists');
+    is_deeply(ProxmodCron::Lease::ticks('gone'), [],
+        'and a job that no longer exists keeps nothing');
+
+    # pmxcfs stopped or unmounted. The cluster store reads as empty, which used
+    # to delete the rendered file and make every cluster job silently vanish.
+    # The wrapper's fire-time guard makes that decision now, with far fresher
+    # information, so the file is left exactly as it is.
+    my $before = ProxmodCronTest::slurp(cluster_path());
+    my $pve = ProxmodCron::Config::pve_dir();
+    rename($pve, "$pve.away");
+
+    my $absent = ProxmodCron::Sync::run();
+
+    is($absent->{results}{cluster}, 'preserved', 'a missing /etc/pve preserves the file');
+    is(ProxmodCronTest::slurp(cluster_path()), $before, 'byte for byte');
+
+    rename("$pve.away", $pve);
+    ProxmodCronTest::cluster_members();
 };
 
 subtest 'apply() is the only thing that touches the file, and it is atomic' => sub {

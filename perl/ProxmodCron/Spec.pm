@@ -339,6 +339,82 @@ sub next_runs {
     return \@out;
 }
 
+=head2 matches($schedule, $when)
+
+Whether C<$schedule> matches the minute containing epoch second C<$when>. The
+same three rules C<next_run> searches with, asked about one instant instead —
+including Vixie's day-field rule, which is why both go through C<_day_matches>
+rather than each having an opinion.
+
+Always false for C<@reboot>: it matches no minute, it matches a boot.
+
+=cut
+
+sub matches {
+    my ($schedule, $when) = @_;
+
+    my $parsed = ref($schedule) eq 'HASH' ? $schedule : parse($schedule);
+    return 0 if $parsed->{reboot};
+
+    $when = time() if !defined $when;
+
+    my ($minute, $hour, $dom, $month, $dow) = @{ $parsed->{fields} };
+
+    my @lt = localtime($when);
+    my ($lmin, $lhour, $lmday, $lmon, $lyear, $lwday) = @lt[1 .. 6];
+
+    return 0 if !$month->{set}->{ $lmon + 1 };
+    return 0 if !_day_matches($dom, $dow, $lmday, $lwday);
+    return 0 if !$hour->{set}->{$lhour};
+    return 0 if !$minute->{set}->{$lmin};
+
+    return 1;
+}
+
+=head2 tick($schedule, $now)
+
+The scheduled minute this run belongs to, as an epoch second: the most recent
+minute at or before C<$now> that C<$schedule> matches, searched back at most
+C<$TICK_LOOKBACK> minutes.
+
+This is what makes a cluster-wide lease possible. Two nodes firing the same job
+do so a fraction of a second apart at best, and the lease has to be a claim on
+the same thing on both — so it is keyed by the time cron I<meant>, not by the
+time either process happened to start. The lookback covers a node whose wrapper
+was not scheduled until after the minute rolled over, which is the only way a
+correct clock lands on the wrong minute.
+
+Falls back to the current minute when nothing matches within the lookback — a
+DST transition, where Debian cron and this parser disagree by design (see
+C<next_run>), or C<@reboot>. Two nodes then derive different ticks and both may
+run, which is the same thing that happens today and is why C<run_on: any>
+refuses C<@reboot> outright.
+
+=cut
+
+our $TICK_LOOKBACK = 2;
+
+sub tick {
+    my ($schedule, $now) = @_;
+
+    my $parsed = ref($schedule) eq 'HASH' ? $schedule : parse($schedule);
+
+    $now = time() if !defined $now;
+
+    # Every real timezone is a whole number of minutes from UTC, so truncating
+    # the epoch second lands on a local minute boundary too.
+    my $minute = $now - ($now % 60);
+
+    return $minute if $parsed->{reboot};
+
+    for my $back (0 .. $TICK_LOOKBACK) {
+        my $candidate = $minute - $back * 60;
+        return $candidate if matches($parsed, $candidate);
+    }
+
+    return $minute;
+}
+
 =head2 nicknames()
 
 The nicknames this parser accepts, for the editor's preset list and for the

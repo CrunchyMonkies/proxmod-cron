@@ -6,6 +6,7 @@ use warnings;
 use Exporter 'import';
 our @EXPORT_OK = qw(
     prefix_tree
+    cluster_members
     reset_registry
     rpcenv
     register_type
@@ -65,7 +66,51 @@ sub prefix_tree {
 
     $ENV{PROXMOD_CRON_TEST_PREFIX} = $root;
 
+    # A tree with /etc/pve in it is a tree that claims pmxcfs is mounted, and a
+    # mounted pmxcfs always publishes .members. Without one, every test looks
+    # like a host whose cluster state cannot be read — which is a real fault, and
+    # not the one any of these tests are about.
+    #
+    # The default is an unclustered PVE host: no 'cluster' key, which is what
+    # pmxcfs writes in local mode. No 'nodename' either, so ProxmodCron::Cluster
+    # falls back to this machine's hostname and node targeting keeps working.
+    cluster_members(root => $root);
+
     return $root;
+}
+
+# Write /etc/pve/.members. With no arguments: a standalone node. With
+# C<nodes>, a cluster:
+#
+#     cluster_members(quorate => 0, nodes => { pve1 => 1, pve2 => 0 })
+sub cluster_members {
+    my (%opt) = @_;
+
+    my $root = $opt{root} || $ENV{PROXMOD_CRON_TEST_PREFIX};
+
+    my %body = (version => 1);
+    $body{nodename} = $opt{nodename} if defined $opt{nodename};
+
+    if ($opt{nodes}) {
+        my $id = 0;
+        $body{cluster} = {
+            name => ($opt{name} || 'test'),
+            quorate => (exists $opt{quorate} ? ($opt{quorate} ? 1 : 0) : 1),
+            nodes => scalar(keys %{ $opt{nodes} }),
+        };
+        $body{nodelist} = {
+            map { $_ => { id => ++$id, online => ($opt{nodes}->{$_} ? 1 : 0) } }
+                keys %{ $opt{nodes} }
+        };
+    }
+
+    File::Path::make_path("$root/etc/pve");
+
+    open(my $fh, '>', "$root/etc/pve/.members") or die "cannot write .members: $!";
+    print {$fh} JSON::PP->new->canonical->encode(\%body);
+    close($fh);
+
+    return "$root/etc/pve/.members";
 }
 
 # Forget every job type, including the built-in. Registration is process-global,

@@ -9,6 +9,7 @@ use PVE::RESTHandler;
 use base qw(PVE::RESTHandler);
 
 use ProxmodCron::API2::Common;
+use ProxmodCron::Cluster;
 use ProxmodCron::Config;
 use ProxmodCron::Registry;
 use ProxmodCron::Spec;
@@ -39,6 +40,7 @@ sub register {
     _index($api);
     _jobs($api);
     _types($api);
+    _membership($api);
     _permissions($api);
 
     return;
@@ -64,7 +66,7 @@ sub _index {
         },
         code => sub {
             return [map { { subdir => $_ } }
-                qw(jobs delegated-jobs types permissions)];
+                qw(jobs delegated-jobs types membership permissions)];
         },
     );
 
@@ -396,6 +398,60 @@ sub _types {
                 valid => 1,
                 next => ProxmodCron::Spec::next_runs($param->{schedule},
                     $param->{count} || 3),
+            };
+        },
+    );
+
+    return;
+}
+
+# Quorum, as this node sees it.
+#
+# Every cluster-scoped job stands down on a node that is not quorate, so a grid
+# full of jobs with a next run that never arrives has exactly one explanation and
+# the UI should be able to say it. That is the whole purpose of this endpoint:
+# without it the failure is invisible from the tab where it matters.
+#
+# It answers for the node serving the request, which is the honest answer — the
+# minority side of a partition genuinely believes it is not quorate, and the
+# majority side genuinely believes it is.
+sub _membership {
+    my ($api) = @_;
+
+    $api->add_method(
+        class => __PACKAGE__,
+        name => 'membership',
+        path => 'membership',
+        method => 'GET',
+        permissions => { check => ['perm', '/', ['Sys.Audit']] },
+        description => 'Whether the node serving this request is quorate, and'
+            . ' which nodes it can see. Cluster-scoped jobs do not run on a node'
+            . ' that is not quorate.',
+        parameters => { additionalProperties => 0, properties => {} },
+        returns => {
+            type => 'object',
+            properties => {
+                known => { type => 'boolean' },
+                quorate => { type => 'boolean' },
+                standalone => { type => 'boolean' },
+                node => { type => 'string', optional => 1 },
+                reason => { type => 'string', optional => 1 },
+                nodes => { type => 'array', items => { type => 'object' } },
+            },
+        },
+        code => sub {
+            my $status = ProxmodCron::Cluster::status();
+
+            return {
+                known => $status->{known} ? 1 : 0,
+                quorate => $status->{quorate} ? 1 : 0,
+                standalone => $status->{standalone} ? 1 : 0,
+                node => ProxmodCron::Cluster::nodename($status),
+                (defined $status->{reason} ? (reason => $status->{reason}) : ()),
+                nodes => [
+                    map { { node => $_, online => $status->{nodes}->{$_}->{online} } }
+                        sort keys %{ $status->{nodes} || {} }
+                ],
             };
         },
     );

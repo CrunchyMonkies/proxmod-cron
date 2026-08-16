@@ -37,7 +37,7 @@ use ProxmodCron::Spec;
 # needs to see when the rendering changes, rather than a list of substrings that
 # each still pass while the file as a whole has become something else.
 
-plan tests => 10;
+plan tests => 11;
 
 ProxmodCron::Registry::register('ProxmodCron::JobType::Command');
 
@@ -283,6 +283,58 @@ subtest 'tracked jobs render through the wrapper, untracked ones do not' => sub 
     # id that needed quoting would still be one argument. Ids cannot contain a
     # space today; this asserts the rendering does not assume that.
     like($tracked, qr/\Q-- \E\/bin\/true\z/, 'the argv follows the -- unchanged');
+};
+
+subtest 'a cluster job carries its fire-time guards on the rendered line' => sub {
+    plan tests => 8;
+
+    my $exec = $ProxmodCron::Render::EXEC;
+
+    # The rendered file is a statement about the last minute; quorum and
+    # placement are questions about this one. So they cannot be answered here —
+    # only delegated, which is what these flags are.
+    my $guarded = cron_line(render('cluster', one(), 'pve1'));
+    is($guarded, "30 2 * * *\troot\t$exec cluster only-job --type command"
+        . ' --require-quorum -- /bin/true',
+        'every cluster job asks the wrapper to check quorum before it runs');
+
+    my $node = cron_line(render('node', one(), 'pve1'));
+    unlike($node, qr/--require-quorum/,
+        'a node job has no cluster to be quorate in and is not asked');
+
+    my $once = cron_line(render('cluster', one(run_on => 'any'), 'pve1'));
+    is($once, "30 2 * * *\troot\t$exec cluster only-job --type command"
+        . " --require-quorum --once --schedule '30 2 * * *' -- /bin/true",
+        'run_on: any adds the lease, with the schedule the tick is derived from');
+
+    # The schedule travels on the line rather than being read back from the
+    # store for the same reason the type does: the tick both nodes race for has
+    # to come from the definition that produced this line.
+    like($once, qr/--schedule '30 2 \* \* \*'/,
+        'and it is quoted, because a cron spec is full of spaces and stars');
+
+    is(cron_line(render('cluster', one(run_on => 'all'), 'pve1')), $guarded,
+        "run_on: all is the default and renders exactly as an absent one does");
+
+    # An untracked cluster job gains a wrapper it did not have before, because
+    # the guard has to live somewhere. --no-record is what keeps everything else
+    # about it the same: no run lock, no history, output straight to cron.
+    my $untracked = cron_line(render('cluster', one(track => 0), 'pve1'));
+    is($untracked, "30 2 * * *\troot\t$exec cluster only-job --type command"
+        . ' --require-quorum --no-record -- /bin/true',
+        'an untracked cluster job is guarded and otherwise left alone');
+
+    unlike(cron_line(render('node', one(track => 0), 'pve1')), qr/\Q$exec\E/,
+        'while an untracked node job still runs its command directly');
+
+    # An operator who named a job and a node has already made the choice the
+    # lease exists to make, so a manual run must not lose a race to a scheduled
+    # tick happening on another node at the same moment.
+    my $manual = ProxmodCron::Render::wrap(
+        ProxmodCron::Config::effective('cluster', one(run_on => 'any'), 'only-job'),
+        ['/bin/true'], manual => 1);
+    ok(!grep({ $_ eq '--once' } @$manual),
+        'a manual run keeps the quorum guard and drops the lease');
 };
 
 subtest 'a cluster job renders only on the nodes it targets' => sub {

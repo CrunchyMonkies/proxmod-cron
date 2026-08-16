@@ -9,6 +9,11 @@ proxmod-cron (0.1.0) unstable; urgency=medium
   * Run tracking and captured output as structured journald entries, read back
     with journalctl field matches; the last-run file under /var/lib is only a
     cache and is rebuildable with `proxmod-cronctl reindex`.
+  * Cluster job placement: `run_on: any` runs a job on exactly one node per
+    scheduled minute, chosen by racing for an atomic lease in /etc/pve, so the
+    job moves to a surviving node with no leader, heartbeat or election. A node
+    that is not quorate stands down from every cluster-scoped job and records a
+    skip; node-scoped jobs and standalone hosts are unaffected.
   * Access control expressed entirely in existing PVE privileges on existing
     ACL paths, with per-job delegation for job types that declare what object
     they are about.

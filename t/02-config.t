@@ -34,7 +34,7 @@ use ProxmodCron::Registry;
 #   definition becomes a command that runs as root; "mostly matched the pattern"
 #   is not a standard to execute against.
 
-plan tests => 12;
+plan tests => 13;
 
 # The built-in type, so `type => 'command'` validates. Registration is
 # process-global and nothing in this file changes it.
@@ -315,6 +315,48 @@ subtest 'validate_job reports every problem, not just the first' => sub {
     like("@{ ProxmodCron::Config::validate_job('fine', job(nodes => ['pve1']), scope => 'node') }",
         qr/only meaningful in the cluster scope/,
         "and 'nodes' in the node scope, where it would do nothing");
+};
+
+subtest "'run_on: any' is refused here, not discovered at 02:30" => sub {
+    plan tests => 12;
+
+    my $cluster = sub {
+        return ProxmodCron::Config::validate_job('once', job(@_), scope => 'cluster');
+    };
+
+    is_deeply($cluster->(run_on => 'any'), [], 'the ordinary case is accepted');
+    is_deeply($cluster->(run_on => 'all'), [], "and so is the default written out");
+
+    # Anything else is a typo, and a typo that read as 'all' would silently run
+    # the job on every node — the exact outcome the administrator was avoiding.
+    like("@{ $cluster->(run_on => 'sometimes') }", qr/must be 'all' or 'any'/,
+        'a value that is neither is refused rather than defaulted');
+    like("@{ $cluster->(run_on => ['any']) }", qr/must be 'all' or 'any'/,
+        'and so is a structure where a string belongs');
+
+    like("@{ ProxmodCron::Config::validate_job('once', job(run_on => 'any'), scope => 'node') }",
+        qr/only meaningful in the cluster scope/,
+        'a node job has no cluster to pick one node out of');
+
+    # Each of the three requirements carries its reason. An administrator told
+    # only the rule has to go and find out why the rule exists.
+    my $untracked = "@{ $cluster->(run_on => 'any', track => 0) }";
+    like($untracked, qr/needs track: true/, 'an untracked job cannot say which node ran it');
+    like($untracked, qr/run record/, 'and is told why');
+
+    my $user = "@{ $cluster->(run_on => 'any', user => 'backup') }";
+    like($user, qr/needs user: root/, 'a non-root job cannot write inside /etc/pve');
+    like($user, qr{/etc/pve}, 'and is told why');
+
+    my $reboot = "@{ $cluster->(run_on => 'any', schedule => '@reboot') }";
+    like($reboot, qr/needs a real schedule/, '@reboot has no tick to lease');
+    like($reboot, qr/every node would run it/, 'and is told what that would mean');
+
+    # All three at once, because validate_job reports everything it found
+    # rather than the first thing it tripped over.
+    is(scalar @{ $cluster->(run_on => 'any', track => 0, user => 'backup',
+        schedule => '@reboot') }, 3,
+        'and a job that breaks all three is told all three');
 };
 
 subtest 'effective() fills the defaults in exactly one place' => sub {

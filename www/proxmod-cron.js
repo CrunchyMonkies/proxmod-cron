@@ -216,6 +216,14 @@
                 Ext.apply({ success: unwrap(callback) }, opts || {}));
         },
 
+        // Whether the node answering this request is quorate. Cluster-scoped
+        // jobs stand down on a node that is not, so a datacenter Cron tab that
+        // did not say so would be showing a schedule that is not running.
+        membership: function (callback, opts) {
+            return request('GET', 'membership', undefined,
+                Ext.apply({ success: unwrap(callback) }, opts || {}));
+        },
+
         // What the caller may actually do, computed server-side with the same
         // helper the write methods enforce with (§8.5). The UI disables what is
         // not permitted; it does not decide it.
@@ -347,6 +355,48 @@
             return enc(gettext('all nodes'));
         }
         return enc(value.join(', '));
+    }
+
+    // 'all' is replication and 'any' is placement — two different things a
+    // cluster job can be, and the grid has to say which without a legend.
+    function renderRunOn(value) {
+        if (value === 'any') {
+            return enc(gettext('one node per run'));
+        }
+        return '<span class="proxmod-cron-muted">'
+            + enc(gettext('every node')) + '</span>';
+    }
+
+    // Which node claimed the last scheduled run of a job that moves. A holder
+    // still marked running long after its tick is a node that died mid-run:
+    // nothing re-runs that tick by design, so this is where it is visible.
+    function renderLastHolder(value, meta, record) {
+        if ((record.data.run_on || 'all') !== 'any') {
+            return '<span class="proxmod-cron-muted">-</span>';
+        }
+
+        var holder = record.data.last_holder;
+
+        if (!holder || !holder.node) {
+            return '<span class="proxmod-cron-muted">'
+                + enc(gettext('not claimed yet')) + '</span>';
+        }
+
+        var when = holder.tick ? stamp(holder.tick) : gettext('an unknown time');
+
+        meta.tdAttr = qtip(enc(Ext.String.format(
+            gettext('Scheduled run of {0}, claimed by {1}'), when, holder.node)));
+
+        if (holder.state === 'running') {
+            return enc(holder.node) + ' <span class="proxmod-cron-muted">('
+                + enc(gettext('running')) + ')</span>';
+        }
+        if (holder.state && holder.state !== 'ok') {
+            return enc(holder.node) + ' <span class="proxmod-cron-error">('
+                + enc(holder.state) + ')</span>';
+        }
+
+        return enc(holder.node);
     }
 
     // The §5.5 cache, which is a cache: an empty answer means "no record", not
@@ -782,6 +832,39 @@
             }
         },
 
+        // 'run_on: any' carries two requirements the server refuses without, so
+        // the form applies them rather than letting the user discover them from
+        // an error dialog: the run record is the only thing that says which node
+        // ran the job, and the lease is a write inside /etc/pve.
+        //
+        // Locked and shown, not hidden: a field that vanished would leave an
+        // administrator wondering what the job now runs as.
+        applyRunOn: function (value) {
+            var me = this;
+            var once = value === 'any';
+            var note = me.down('#runOnNote');
+            var track = me.down('[name=track]');
+            var user = me.down('[name=user]');
+
+            if (note) {
+                note.setVisible(once);
+            }
+
+            if (track) {
+                if (once) {
+                    track.setValue(1);
+                }
+                track.setReadOnly(once || !!me.readOnly);
+            }
+
+            if (user) {
+                if (once) {
+                    user.setValue('');
+                }
+                user.setReadOnly(once || !!me.readOnly);
+            }
+        },
+
         lockFields: function () {
             this.down('form').getForm().getFields().each(function (field) {
                 // Everything except the one control §2.1 leaves live on an
@@ -929,6 +1012,52 @@
                     allowBlank: true,
                     emptyText: gettext('empty means every node'),
                 });
+
+                // Replication or placement. The two readings of "a cluster job"
+                // are far enough apart that the field says what each one does
+                // rather than naming the mode and leaving it to the docs.
+                items.push({
+                    xtype: 'combobox',
+                    itemId: 'runOnCombo',
+                    name: 'run_on',
+                    fieldLabel: gettext('Run on'),
+                    editable: false,
+                    queryMode: 'local',
+                    displayField: 'title',
+                    valueField: 'value',
+                    value: 'all',
+                    store: {
+                        fields: ['value', 'title'],
+                        data: [
+                            { value: 'all',
+                                title: gettext('every node it targets, every time') },
+                            { value: 'any',
+                                title: gettext('exactly one node per scheduled run') },
+                        ],
+                    },
+                    listeners: {
+                        change: function (combo, value) {
+                            Proxmod.guard('proxmod-cron run_on change', function () {
+                                me.applyRunOn(value);
+                            });
+                        },
+                    },
+                });
+
+                items.push({
+                    xtype: 'displayfield',
+                    itemId: 'runOnNote',
+                    hideLabel: true,
+                    hidden: true,
+                    cls: 'proxmod-cron-note',
+                    value: enc(gettext('The nodes race for each scheduled run and'
+                        + ' one wins it; a node that is down or has lost quorum'
+                        + ' simply loses the race, so the job moves on its own.'
+                        + ' It needs "Record runs" on, because the run record is'
+                        + ' the only thing that says which node ran it, and it'
+                        + ' runs as root, because claiming a run is a write'
+                        + ' inside /etc/pve that no other user may make.')),
+                });
             }
 
             items.push({
@@ -1056,7 +1185,12 @@
                 me.down('proxmodCronSchedule').setValue(values.schedule);
                 if (me.scope === 'cluster') {
                     me.down('[name=nodes]').setValue(values.nodes || []);
+                    me.down('#runOnCombo').setValue(values.run_on || 'all');
                 }
+            }
+
+            if (me.scope === 'cluster') {
+                me.applyRunOn(me.down('#runOnCombo').getValue());
             }
 
             me.loadTypes(values ? values.type : undefined, values);
@@ -1595,7 +1729,25 @@
         perms: undefined,
 
         reload: function () {
-            this.getStore().load();
+            var me = this;
+
+            me.getStore().load();
+
+            // Quorum is the thing most likely to have changed between two
+            // presses of Reload, and the one that decides whether any of these
+            // rows will run at all.
+            if (me.scope === 'cluster' && me.down('#quorumBanner')) {
+                ProxmodCron.api.membership(function (data) {
+                    if (!me.destroyed) {
+                        me.showMembership(data);
+                    }
+                }, {
+                    // Silent: a cluster tab whose job list loaded is still
+                    // useful, and the banner standing as it was beats an error
+                    // dialog over a request nobody asked for.
+                    failure: function () { /* the banner stands as it was */ },
+                });
+            }
         },
 
         selected: function () {
@@ -1763,6 +1915,65 @@
             this.updateButtons();
         },
 
+        // A cluster job does not run on a node that cannot confirm it is still
+        // in the cluster. Without this the datacenter tab would show a schedule
+        // that is, on this node, not happening — and the only other place that
+        // says so is `proxmod-cronctl doctor` on a shell.
+        //
+        // "this node" is the node serving the request, which for a datacenter
+        // tab is whichever one the browser is talking to. Said in the text,
+        // because a cluster-wide banner is what it would otherwise be read as.
+        showMembership: function (data) {
+            var me = this;
+            var banner = me.down('#quorumBanner');
+
+            if (!banner) {
+                return;
+            }
+
+            if (!data || data.standalone) {
+                banner.setHidden(true);
+                return;
+            }
+
+            var node = data.node || gettext('this node');
+            var text;
+            var cls;
+
+            if (!data.quorate && data.known) {
+                cls = 'proxmod-cron-error';
+                text = Ext.String.format(gettext('{0} is not quorate. Every'
+                    + ' cluster job stands down there until quorum returns;'
+                    + ' node-scoped jobs are unaffected.'), node);
+            } else if (!data.known) {
+                cls = 'proxmod-cron-warning';
+                text = Ext.String.format(gettext('The cluster state cannot be'
+                    + ' determined on {0}, so every cluster job stands down'
+                    + ' there: {1}'), node, data.reason || gettext('no reason given'));
+            } else {
+                var offline = [];
+                Ext.each(data.nodes || [], function (entry) {
+                    if (!entry.online) {
+                        offline.push(entry.node);
+                    }
+                });
+
+                if (!offline.length) {
+                    banner.setHidden(true);
+                    return;
+                }
+
+                cls = 'proxmod-cron-warning';
+                text = Ext.String.format(gettext('Offline: {0}. Jobs targeting'
+                    + ' only those nodes are not running; jobs set to one node'
+                    + ' per run will be claimed by a node that is up.'),
+                    offline.join(', '));
+            }
+
+            banner.update('<div class="' + cls + '">' + enc(text) + '</div>');
+            banner.setHidden(false);
+        },
+
         initComponent: function () {
             var me = this;
 
@@ -1772,7 +1983,8 @@
 
             me.store = Ext.create('Ext.data.Store', {
                 fields: ['id', 'scope', 'type', 'enabled', 'schedule', 'next_run',
-                    'user', 'comment', 'command', 'nodes', 'origin', 'owner',
+                    'user', 'comment', 'command', 'nodes', 'run_on', 'last_holder',
+                    'origin', 'owner',
                     'orphaned', 'managed_in', 'track', 'keep_output',
                     'can_edit', 'can_delete', 'can_toggle', 'can_run', 'can_modify',
                     'last_run', 'schedule_error', 'type_available'],
@@ -1929,6 +2141,24 @@
                     renderer: renderNodes,
                 });
 
+                columns.push({
+                    header: gettext('Run on'),
+                    dataIndex: 'run_on',
+                    width: 150,
+                    renderer: renderRunOn,
+                });
+
+                // Placement, not history — which is why it is here and the last
+                // result is not. It comes from /etc/pve, so every node gives the
+                // same answer, and that answer is about the cluster rather than
+                // about whichever node served the request.
+                columns.push({
+                    header: gettext('Last claimed by'),
+                    dataIndex: 'last_holder',
+                    width: 150,
+                    renderer: renderLastHolder,
+                });
+
                 // No last-result column here, deliberately. Run history is
                 // node-scoped because journald is, and a cluster-wide column
                 // would mean one request per row per node — or a number that
@@ -1971,6 +2201,16 @@
 
             me.on('afterrender', function () {
                 Proxmod.guard('proxmod-cron init', function () {
+                    if (me.scope === 'cluster') {
+                        me.addDocked({
+                            xtype: 'component',
+                            itemId: 'quorumBanner',
+                            dock: 'top',
+                            hidden: true,
+                            padding: '4 8',
+                        });
+                    }
+
                     // The instant, no-round-trip answer first, so the toolbar is
                     // not wrong for the length of a request; then the accurate
                     // one, which is the only one anything is decided from.

@@ -241,6 +241,58 @@ configuration on every daemon restart.
 see the job, they can stop it, and they cannot edit or remove it while your
 extension is loaded. `update` and `delete` on another extension's job die.
 
+### `run_on: any` — a cluster job that runs on exactly one node
+
+A cluster-scoped job you `ensure()` is rendered on every node it targets, and
+every one of them runs it. That is right for fan-out work — rotate something on
+each host — and wrong for a job that must happen once *somewhere*: a backup, a
+report, a reconciliation pass. For those, set `run_on`:
+
+```perl
+$cron->ensure('cluster', 'acme-reconcile', {
+    type     => 'acme-reconcile',
+    schedule => '*/15 * * * *',
+    run_on   => 'any',    # one node per scheduled run, whichever wins the race
+    track    => 1,        # required — see below
+});
+```
+
+Each scheduled minute, every targeted node races to claim a lease in `/etc/pve`;
+one wins and runs the job, the rest record a skip and exit. There is no leader,
+no heartbeat and no registration step, so a node that is powered off simply
+loses the race. Placement is a consequence of which nodes are alive, not
+something your extension has to track, and there is nothing to fail over.
+
+Four rules, all enforced by `ProxmodCron::Config::validate_job`, which `create`,
+`ensure` and `update` all go through. A mistake therefore dies inside
+`proxmod_register` — disabling your extension, loudly, at daemon start — rather
+than being discovered at 03:30 on a node nobody was watching:
+
+| Rule | Why |
+|---|---|
+| the cluster scope only | a node job has exactly one candidate; there is nothing to place |
+| `track: true` | the run record is the only thing that says which node ran it |
+| `user: root` — the default, so simply do not set it | the lease is an atomic write inside `/etc/pve`, which no other user can perform |
+| a real schedule, not `@reboot` | `@reboot` has no scheduled minute to lease, and every node would run it on its own boot |
+
+Four consequences your extension must not assume away:
+
+- **`nodes` still applies.** `nodes => ['pve1', 'pve2']` with `run_on => 'any'`
+  means one of *those two*, not one of the cluster.
+- **It is placement, not load balancing.** Nothing rotates the winner, and on a
+  settled cluster the same node tends to win run after run. The guarantee is
+  *once*, not *evenly*; if your extension needs work spread across nodes, spread
+  it yourself with `nodes` and separate jobs.
+- **A node that dies mid-run is not retried.** The scheduled minute is consumed;
+  the next one lands on a survivor. Nothing ever runs twice for one scheduled
+  minute — the property a non-idempotent job needs — but it does mean your job
+  can be interrupted and left half-done, and `run_on: any` will not finish it for
+  you. If that matters, make the job resumable.
+- **Quorum is required for *every* cluster-scoped job**, both values of `run_on`.
+  A node that cannot confirm the cluster stands down and journals a skip instead
+  of running. A job that must survive a partition belongs in the node scope,
+  where it is unconditional.
+
 ---
 
 ## 3. The REST API
@@ -258,6 +310,7 @@ extension is loaded. `update` and `delete` on another extension's job die.
 | `PUT` | `jobs/{id}/enabled` | `Sys.Modify` — **any origin** |
 | `DELETE` | `jobs/{id}` | `Sys.Modify` |
 | `POST`/`PUT`/`DELETE` | `delegated-jobs[/{id}]` | delegated (see §1) |
+| `GET` | `membership` | `Sys.Audit` |
 | `GET` | `types` | any authenticated user |
 | `GET` | `schedule` | any authenticated user |
 | `GET` | `permissions` | any authenticated user |
@@ -304,7 +357,14 @@ that looks exactly like "this job never ran".
 - **Run history is node-scoped**, because journald is. There is no cluster-wide
   run history endpoint and the cluster grid has no last-result column — a
   cluster-wide one would mean one request per row per node, or a number that
-  silently means "whichever node answered".
+  silently means "whichever node answered". *Placement* is the exception:
+  `last_holder` comes from `/etc/pve`, so every node returns the same answer.
+- **`GET membership` answers for the node serving the request**, not for the
+  cluster. That is the honest answer — during a partition the minority side
+  genuinely believes it is not quorate and the majority side genuinely believes
+  it is, and which one you get depends on which node your browser is talking to.
+  `known: false` means this node cannot tell; treat it as not quorate, because
+  the wrapper does.
 - **`runs/{runid}/log` paginates by journald cursor**, not by offset, so a live
   tail cannot skip or repeat a line as new ones arrive mid-poll.
 
@@ -324,6 +384,21 @@ so you never re-derive the rules:
 Each flag is the **AND** of the origin rule and the caller's privileges, computed
 by one helper that the write methods also call — so a flag cannot claim something
 the enforcement would refuse.
+
+A cluster row carries `run_on`, and a `run_on: any` row also carries
+`last_holder` — the most recent lease, or absent if none has been claimed yet:
+
+```json
+{ "run_on": "any",
+  "last_holder": { "node": "pve2", "state": "ok", "tick": 1771200600,
+                   "started": 1771200601, "finished": 1771200604,
+                   "run": "1771200601412-3f9a2c07", "exit": 0,
+                   "duration_ms": 3120 } }
+```
+
+`state` is `running` until the winner finishes. A `running` holder from a tick
+well in the past is a node that died mid-run — the run is not retried, and
+`proxmod-cronctl doctor` reports it.
 
 ---
 
@@ -401,6 +476,7 @@ ProxmodCron.api.sync(node, opts)
 ProxmodCron.api.types(scope, node, callback, opts)   // callback(data)
 ProxmodCron.api.permissions(scope, node, callback, opts)
 ProxmodCron.api.schedule(value, count, callback, opts)
+ProxmodCron.api.membership(callback, opts)           // quorum, as the serving node sees it
 ProxmodCron.api.url(path, node)
 ProxmodCron.api.storeUrl(path, node)                 // for a `proxmox` proxy
 
@@ -415,8 +491,8 @@ ProxmodCron.format.duration(ms)
 `opts` is a `Proxmod.api.request` config: `params`, `success`, `failure`,
 `waitMsgTarget`, and `node` where the signature does not already take one. As
 everywhere in proxmod, **`success` receives the whole response** — what the Perl
-method returned is at `response.result.data`. The three callback-taking helpers
-(`types`, `permissions`, `schedule`) unwrap it for you.
+method returned is at `response.result.data`. The four callback-taking helpers
+(`types`, `permissions`, `schedule`, `membership`) unwrap it for you.
 
 Widgets you can drop into your own panels:
 
