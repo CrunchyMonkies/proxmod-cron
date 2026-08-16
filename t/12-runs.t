@@ -30,7 +30,7 @@ use ProxmodCron::Runs;
 # that list is built from a request parameter and none of it may go near a
 # shell.
 
-plan tests => 10;
+plan tests => 11;
 
 my $EPOCH = 1_739_000_000;
 
@@ -124,6 +124,34 @@ subtest 'entries fold into runs' => sub {
 
     is($second->{exit}, 3, 'and the second run kept its own exit status');
     is($second->{lines}, 12, 'and its own line count');
+};
+
+subtest "a run is timed by the wrapper's clock, not by journald's" => sub {
+    plan tests => 4;
+
+    # PROXMOD_CRON_STARTED is the same reading proxmod-cron-exec wrote into the
+    # status cache. journald stamps its own when the datagram arrives, and the
+    # two are a different reading of the same instant — close, but not equal.
+    # `proxmod-cronctl reindex` rebuilds the cache from these entries, so a fold
+    # that preferred the receive timestamp would produce a cache that disagrees
+    # with the one the wrapper wrote, by a second, with nothing to explain it.
+    my @entries = run_entries(run => '1739000000000-cccccccc', at => 0);
+    $_->{PROXMOD_CRON_STARTED} = $EPOCH - 4 for @entries;
+
+    my $run = ProxmodCron::Runs::fold(\@entries)->[0];
+
+    is($run->{started}, $EPOCH - 4, "started is the wrapper's, not the journal's");
+    is($run->{finished}, $EPOCH - 2,
+        'and finished is that plus the duration it measured, for the same reason');
+
+    # Without the field there is nothing better to use, and an older record that
+    # predates it must still fold.
+    delete $_->{PROXMOD_CRON_STARTED} for @entries;
+
+    my $legacy = ProxmodCron::Runs::fold(\@entries)->[0];
+
+    is($legacy->{started}, $EPOCH, 'a record without it falls back to the journal');
+    is($legacy->{finished}, $EPOCH + 2, 'and is folded exactly as before');
 };
 
 subtest 'a run with no finish is only running while its lock is held' => sub {

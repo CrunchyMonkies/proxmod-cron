@@ -167,6 +167,12 @@ sub wrap {
     my @wrapper = ($EXEC, $job->{scope}, $job->{id});
     push @wrapper, '--no-output' if !$job->{keep_output};
 
+    # The type travels with the argv rather than being looked up in the store at
+    # run time, so PROXMOD_CRON_TYPE always describes the definition that
+    # produced this line. A store read would label a run with a type the argv
+    # does not match, in the window between an edit and the next sync.
+    push @wrapper, '--type', $job->{type} if defined $job->{type};
+
     return [@wrapper, '--', @$argv];
 }
 

@@ -5,7 +5,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 MAILTO=""
 
 # job: a-trim (command) - fstrim all mounts
-30 2 * * *	root	@PREFIX@/usr/lib/proxmod-cron/proxmod-cron-exec node a-trim -- /usr/sbin/fstrim -a
+30 2 * * *	root	@PREFIX@/usr/lib/proxmod-cron/proxmod-cron-exec node a-trim --type command -- /usr/sbin/fstrim -a
 
 # job: b-report (command) - everything awkward, in one argv
 */15 * * * *	root	/usr/local/bin/report --label 'monthly report' 'it'\''s here' '50\%' '$HOME' ''
@@ -14,10 +14,10 @@ MAILTO=""
 #0 4 * * 0	root	/usr/lib/acme/backup --full
 
 # job: d-acme (acme-backup) [acme-backup]
-@daily	root	@PREFIX@/usr/lib/proxmod-cron/proxmod-cron-exec node d-acme -- /usr/lib/acme/backup --vmid 101
+@daily	root	@PREFIX@/usr/lib/proxmod-cron/proxmod-cron-exec node d-acme --type acme-backup -- /usr/lib/acme/backup --vmid 101
 
 # job: e-chatty (command) - tracked, but its output is not kept
-@hourly	root	@PREFIX@/usr/lib/proxmod-cron/proxmod-cron-exec node e-chatty --no-output -- /usr/bin/chatty
+@hourly	root	@PREFIX@/usr/lib/proxmod-cron/proxmod-cron-exec node e-chatty --no-output --type command -- /usr/bin/chatty
 
 # job: f-orphan (gone-away) - the plugin for this is not installed
 # UNAVAILABLE: job type 'gone-away' is not registered

@@ -194,7 +194,7 @@ subtest 'show, including the last run and an id that does not exist' => sub {
 
     like($r->{out}, qr/^type\s+command$/m, 'the type');
     like($r->{out}, qr/^comment\s+fstrim all mounts$/m, 'the comment');
-    like($r->{out}, qr{^command\s+\Q$ROOT\E/usr/lib/proxmod-cron/proxmod-cron-exec node nightly-trim -- /bin/echo hello$}m,
+    like($r->{out}, qr{^command\s+\Q$ROOT\E/usr/lib/proxmod-cron/proxmod-cron-exec node nightly-trim --type command -- /bin/echo hello$}m,
         'the command as cron would run it, wrapper included');
     like($r->{out}, qr/^next runs\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d, /m, 'three next runs');
 
@@ -294,7 +294,7 @@ subtest 'run puts a manual run through the same wrapper cron uses' => sub {
 
     my $r = ctl('run', 'says-hello');
     is($r->{exit}, 0, 'a successful job exits 0');
-    like($r->{out}, qr/proxmod-cron-exec node says-hello -- /, 'the argv is shown before it runs');
+    like($r->{out}, qr/proxmod-cron-exec node says-hello --type command -- /, 'the argv is shown before it runs');
     like($r->{out}, qr/^finished$/m, 'and the result after');
 
     my @entries = @{ $drain->() };
@@ -359,17 +359,22 @@ subtest 'runs and log read history back out of journald' => sub {
 };
 
 subtest 'reindex rebuilds the cache the wrapper wrote, byte for byte' => sub {
-    plan tests => 6;
+    plan tests => 9;
 
     wipe();
     $drain->();
 
+    # max_lines is deliberately tiny so 'noisy' trips the line cap on its fourth
+    # echo rather than on its ten-thousandth, while 'chatty' stays just under it.
     store('node', {
         'chatty' => { type => 'command', schedule => '@daily',
             command => ['/bin/sh', '-c', 'echo one; echo two >&2; echo three'] },
-    });
+        'noisy' => { type => 'command', schedule => '@daily',
+            command => ['/bin/sh', '-c', 'echo a; echo b; echo c; echo d'] },
+    }, max_lines => 3);
 
     ctl('run', 'chatty');
+    ctl('run', 'noisy');
 
     my $written = ProxmodCronTest::slurp(ProxmodCron::State::file());
     ok(defined $written && $written =~ /chatty/, 'the wrapper wrote a cache record');
@@ -377,23 +382,31 @@ subtest 'reindex rebuilds the cache the wrapper wrote, byte for byte' => sub {
     my $record = ProxmodCron::State::get('node', 'chatty');
     is(scalar(@{ $record->{tail} }), 3, 'with all three output lines in its tail');
 
-    # The journal fixture is the datagrams the wrapper actually sent, with the
-    # timestamps journald would have stamped on them — start and finish are the
-    # moments the record already names, which is what makes this a test of the
-    # rebuild rather than of the clock.
+    my $capped = ProxmodCron::State::get('node', 'noisy');
+    is($capped->{truncated}, 1, 'the capped run is flagged truncated');
+    unlike(join("\n", @{ $capped->{tail} }), qr/output truncated/,
+        'and its tail is what the job said, not our notice about it');
+
+    # journald stamps its own clock on arrival, and that reading is not the one
+    # the wrapper wrote into the cache. Skew every entry by five seconds: a
+    # rebuild that took `started` or `finished` from the receive timestamp
+    # instead of from the wrapper's own fields would now be five seconds out,
+    # which is the difference this test exists to catch.
+    my $SKEW = 5;
+
     my @sent = @{ $drain->() };
     my $seq = 0;
 
     my @fixture = map {
-        my $event = $_->{PROXMOD_CRON_EVENT} || '';
-        my $when = $event eq 'start' ? $record->{started}
-            : $event eq 'finish' ? $record->{finished}
-            : $record->{started};
+        my $when = ($record->{started} + $SKEW) * 1_000_000;
         # A leading '+' or perl reads this as a block and returns a flat list.
-        +{ %$_, __REALTIME_TIMESTAMP => $when * 1_000_000, __CURSOR => 'c' . $seq++ };
+        +{ %$_, __REALTIME_TIMESTAMP => $when, __CURSOR => 'c' . $seq++ };
     } @sent;
 
-    ok(scalar(@fixture) >= 5, 'the run produced a start, three output lines and a finish');
+    ok(scalar(@fixture) >= 9, 'both runs produced their start, output and finish records');
+
+    ok(scalar(grep { ($_->{PROXMOD_CRON_NOTICE} || '') eq 'truncated' } @fixture),
+        'including the truncation notice, tagged as ours rather than the job\'s');
 
     ProxmodCronTest::journalctl_stub(\@fixture);
 
@@ -401,14 +414,14 @@ subtest 'reindex rebuilds the cache the wrapper wrote, byte for byte' => sub {
     ok(!-e ProxmodCron::State::file(), 'the cache is deleted, as §5.5 says it may be');
 
     my $rebuilt = ctl('reindex');
-    like($rebuilt->{out}, qr/rebuilt 1 record from the journal/, 'reindex reports what it did');
+    like($rebuilt->{out}, qr/rebuilt 2 records from the journal/, 'reindex reports what it did');
 
     is(ProxmodCronTest::slurp(ProxmodCron::State::file()), $written,
         'and the rebuilt cache is byte-identical to the one the wrapper wrote');
 };
 
 subtest 'doctor finds the things that break cron and logging silently' => sub {
-    plan tests => 9;
+    plan tests => 11;
 
     wipe();
     store('node', { 'nightly-trim' => $COMMAND_JOB });
@@ -417,14 +430,19 @@ subtest 'doctor finds the things that break cron and logging silently' => sub {
     unlink($anchor);
 
     my $r = ctl('doctor');
-    is($r->{exit}, 1, 'an error exits 1');
+    is($r->{exit}, 2, 'an error exits 2');
     like($r->{out}, qr/^ERROR .*anchor.*is missing/m,
         'a missing anchor is the error, because nothing runs without it');
 
     write_file($anchor, "* * * * * root /usr/lib/proxmod-cron/proxmod-cron-sync\n");
 
-    like(ctl('doctor')->{out}, qr/^WARNING .*differs from what would be rendered/m,
+    my $drift = ctl('doctor');
+    like($drift->{out}, qr/^WARNING .*differs from what would be rendered/m,
         'an unrendered store is drift the next sync would overwrite');
+
+    # The status is what a monitoring check reads. A warning means something is
+    # quietly not working, so it cannot share an exit code with a clean run.
+    is($drift->{exit}, 1, 'warnings alone exit 1');
 
     ctl('sync');
 
@@ -445,6 +463,7 @@ subtest 'doctor finds the things that break cron and logging silently' => sub {
     my $mailto = ctl('doctor');
     like($mailto->{out}, qr/^WARNING\s+node job 'silent' is not tracked.*discarded/m,
         'track: false under an empty MAILTO throws the output away');
+    is($mailto->{exit}, 1, 'and that warning is enough to make the status non-zero');
 
     like($mailto->{out}, qr/^WARNING .*journald is volatile/m,
         'a host with no persistent journal is warned about');

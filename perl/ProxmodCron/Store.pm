@@ -408,8 +408,9 @@ sub _after_write {
     return if !$result;
 
     ProxmodCron::Journal::send_entry({
-        PROXMOD_CRON_JOB => $id,
-        PROXMOD_CRON_SCOPE => $scope,
+        %{ ProxmodCron::Journal::job_fields({
+            id => $id, scope => $scope, type => ($job ? $job->{type} : undef),
+        }) },
         PROXMOD_CRON_EVENT => 'change',
         MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{change},
         PRIORITY => 4,
@@ -471,8 +472,12 @@ sub _audit {
     };
 
     ProxmodCron::Journal::send_entry({
-        PROXMOD_CRON_JOB => $id,
-        PROXMOD_CRON_SCOPE => $scope,
+        # job_fields, so a change record is tagged exactly like the run records
+        # it interleaves with and `journalctl PROXMOD_CRON_TYPE=acme-backup`
+        # returns both.
+        %{ ProxmodCron::Journal::job_fields({
+            id => $id, scope => $scope, type => ($job ? $job->{type} : undef),
+        }) },
         PROXMOD_CRON_EVENT => 'change',
         PROXMOD_CRON_USER => $who,
         MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{change},

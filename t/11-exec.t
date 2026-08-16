@@ -33,7 +33,7 @@ use ProxmodCron::State;
 # PROXMOD_CRON_TEST_SOCKET, honoured only for a non-root process — because a
 # package variable does not cross a fork+exec.
 
-plan tests => 10;
+plan tests => 11;
 
 my $EXEC = "$FindBin::Bin/../exec/proxmod-cron-exec";
 my $PERL_DIR = "$FindBin::Bin/../perl";
@@ -160,6 +160,32 @@ subtest 'both streams are captured, tagged and tied to one run' => sub {
     is($stdout[0]{PRIORITY}, '6', 'a stdout line is informational');
 
     is($finish->{PROXMOD_CRON_EXIT}, '0', 'and the finish record says it succeeded');
+};
+
+subtest 'the type travels with the argv, not out of the store' => sub {
+    plan tests => 5;
+
+    my $result = run_exec(['node', 'typed-job', '--type', 'acme-backup', '--',
+        perl_job(q{ print "working\n"; })]);
+
+    is($result->{exit}, 0, 'the flag does not disturb the run');
+
+    my $start = one_event($result, 'start');
+    my $finish = one_event($result, 'finish');
+    my $output = events($result, 'output');
+
+    # Every record of the run, not just one of them: the query this field exists
+    # for is `journalctl PROXMOD_CRON_TYPE=acme-backup`, and a field on the start
+    # record alone would answer it with a third of the run.
+    is($start->{PROXMOD_CRON_TYPE}, 'acme-backup', 'the start record carries the type');
+    is($finish->{PROXMOD_CRON_TYPE}, 'acme-backup', 'so does the finish record');
+    is($output->[0]{PROXMOD_CRON_TYPE}, 'acme-backup', 'and so does every output line');
+
+    # Absent rather than empty, so `journalctl PROXMOD_CRON_TYPE=` does not match
+    # everything that ever ran.
+    my $untyped = run_exec(['node', 'untyped-job', '--', perl_job(q{ exit(0) })]);
+    ok(!exists one_event($untyped, 'start')->{PROXMOD_CRON_TYPE},
+        'a run with no type has no type field at all');
 };
 
 subtest 'the wrapper never alters what the job returned' => sub {

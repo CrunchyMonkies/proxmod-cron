@@ -102,6 +102,9 @@ usage: proxmod-cronctl <command> [options]
   inventory                          every cron entry on this host
   reindex                            rebuild the status cache from journald
   doctor                             check what silently breaks cron and logging
+
+doctor exits 0 when it has nothing to report, 1 when it emitted warnings and 2
+when it emitted errors, so it can be run from a monitoring check directly.
 USAGE
 
     return;
@@ -663,18 +666,22 @@ sub cmd_reindex {
 # The last few lines of a run, in the same form proxmod-cron-exec keeps them, so
 # a rebuilt cache is the cache the wrapper would have written.
 #
-# One knowing difference: on a run that hit the line cap, the wrapper journalled
-# a truncation notice but kept it out of its own tail, so a rebuilt tail can
-# carry that notice where the original did not. It only affects runs already
-# flagged `truncated`, and the alternative — recognising the notice by its
-# message text — would be a worse thing to depend on than a one-line difference
-# in a tooltip.
+# The wrapper journals a truncation notice on a capped run but keeps it out of
+# its own tail, because the tail is what the job said. Ask for one line more than
+# we need and drop the notice by its PROXMOD_CRON_NOTICE field — one extra line
+# is enough because a run has at most one notice, and matching on the field
+# rather than on the message text means the wording stays free to change.
 sub output_tail {
     my ($runid) = @_;
 
-    my $page = ProxmodCron::Runs::output($runid, limit => $ProxmodCron::State::TAIL_LINES);
+    my $want = $ProxmodCron::State::TAIL_LINES;
 
-    return [map { ($_->{stream} || 'stdout') . ': ' . $_->{text} } @{ $page->{lines} }];
+    my $page = ProxmodCron::Runs::output($runid, limit => $want + 1);
+
+    my @lines = grep { !defined $_->{notice} } @{ $page->{lines} };
+    splice(@lines, 0, @lines - $want) if @lines > $want;
+
+    return [map { ($_->{stream} || 'stdout') . ': ' . $_->{text} } @lines];
 }
 
 sub cmd_doctor {
@@ -773,7 +780,14 @@ sub cmd_doctor {
 
     print "ok       nothing to report\n" if !@errors && !@warnings && !@notes;
 
-    return @errors ? 1 : 0;
+    # 0 clean, 1 warnings, 2 errors. A warning here means something is quietly
+    # not working — a job whose output goes nowhere, a generated file about to be
+    # overwritten, history that dies at reboot — and exiting 0 on those made this
+    # command useless to the monitoring check it is meant for. Notes are not
+    # findings and do not affect the status.
+    return 2 if @errors;
+    return 1 if @warnings;
+    return 0;
 }
 
 sub journald_rate_limit {

@@ -15,7 +15,7 @@ use ProxmodCron::State;
 # The run wrapper. Every job with track: true renders through it, and it is the
 # only thing that writes run records.
 #
-#   proxmod-cron-exec <scope> <jobid> [--no-output] -- <argv...>
+#   proxmod-cron-exec <scope> <jobid> [--no-output] [--type <type>] -- <argv...>
 #
 # Four properties that are easy to get wrong, all of them here:
 #
@@ -48,14 +48,16 @@ exit(main(@ARGV));
 sub main {
     my @args = @_;
 
-    my ($scope, $id, $keep_output, $argv) = parse_args(@args);
+    my ($scope, $id, $keep_output, $type, $argv) = parse_args(@args);
 
+    # The type comes in on the command line rather than out of the store. The
+    # renderer put it there alongside the argv it derived from that same type, so
+    # the two cannot disagree, and the wrapper stays free of a store read it
+    # would have to degrade around on every single run.
     my $job = {
         id => $id,
         scope => $scope,
-        # The type is not passed on the command line: it would be one more thing
-        # in /etc/cron.d to keep in step with the store for no gain, and the
-        # journal record does not need it to be queryable by job.
+        type => $type,
     };
 
     load_limits();
@@ -83,6 +85,7 @@ sub main {
         MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{start},
         PROXMOD_CRON_EVENT => 'start',
         PROXMOD_CRON_RUN => $run,
+        PROXMOD_CRON_STARTED => int($started),
         MESSAGE => "started $scope job '$id': " . join(' ', @$argv),
     });
 
@@ -98,6 +101,11 @@ sub main {
         MESSAGE_ID => $ProxmodCron::Journal::MESSAGE_ID{finish},
         PROXMOD_CRON_EVENT => 'finish',
         PROXMOD_CRON_RUN => $run,
+        # Both records carry the wrapper's own start time. journald's receive
+        # timestamp is a different clock reading of the same instant and can land
+        # a second either side of it, which is enough to make a rebuilt cache
+        # disagree with the one written here — see ProxmodCron::Runs::fold.
+        PROXMOD_CRON_STARTED => int($started),
         PROXMOD_CRON_EXIT => $exit,
         PROXMOD_CRON_SIGNAL => $signal,
         PROXMOD_CRON_DURATION_MS => $duration_ms,
@@ -136,7 +144,7 @@ sub main {
 sub parse_args {
     my @args = @_;
 
-    my ($scope, $id);
+    my ($scope, $id, $type);
     my $keep_output = 1;
     my @argv;
     my $seen_separator = 0;
@@ -152,6 +160,12 @@ sub parse_args {
 
         if ($arg eq '--no-output') {
             $keep_output = 0;
+            next;
+        }
+
+        if ($arg eq '--type') {
+            $type = shift @args;
+            usage("--type needs a value") if !defined $type;
             next;
         }
 
@@ -174,14 +188,20 @@ sub parse_args {
     my ($clean_id) = ($id =~ $ProxmodCron::Config::ID_PATTERN);
     usage("invalid job id '$id'") if !defined $clean_id;
 
-    return ($clean_scope, $clean_id, $keep_output, \@argv);
+    # A type that does not look like a type is dropped rather than fatal: the
+    # job still has to run, and the worst case is one absent field on its
+    # records.
+    my $clean_type;
+    ($clean_type) = ($type =~ $ProxmodCron::Config::ID_PATTERN) if defined $type;
+
+    return ($clean_scope, $clean_id, $keep_output, $clean_type, \@argv);
 }
 
 sub usage {
     my ($why) = @_;
     print STDERR "proxmod-cron-exec: $why\n";
     print STDERR "usage: proxmod-cron-exec <cluster|node> <jobid> [--no-output]"
-        . " -- <command> [args...]\n";
+        . " [--type <type>] -- <command> [args...]\n";
     exit(2);
 }
 
@@ -404,6 +424,10 @@ sub emit {
                 PROXMOD_CRON_EVENT => 'output',
                 PROXMOD_CRON_RUN => $run,
                 PROXMOD_CRON_STREAM => $stream,
+                # Tagged because it is ours, not the job's. The log view shows it
+                # like any other line; the output tail leaves it out, which is
+                # what keeps a rebuilt tail identical to the one below.
+                PROXMOD_CRON_NOTICE => 'truncated',
                 PRIORITY => 4,
                 MESSAGE => "[proxmod-cron] output truncated after $MAX_LINES lines",
             });

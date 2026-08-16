@@ -179,7 +179,16 @@ journalctl MESSAGE_ID=<finish> --since -30d            # every completion
 
 Fields: `PROXMOD_CRON_JOB`, `_SCOPE`, `_TYPE`, `_RUN`, `_EVENT`
 (`start`/`output`/`finish`/`skipped`/`change`), `_STREAM`, `_EXIT`, `_SIGNAL`,
-`_DURATION_MS`, `_USER`, plus `PRIORITY` and a per-event-class `MESSAGE_ID`.
+`_DURATION_MS`, `_STARTED`, `_USER`, `_NOTICE`, plus `PRIORITY` and a
+per-event-class `MESSAGE_ID`.
+
+`_TYPE` is carried on the rendered cron line rather than looked up when the job
+runs, so it always names the definition that produced the argv beside it.
+`_STARTED` is the wrapper's own reading of when the run began, on both the start
+and the finish record — journald's receive timestamp is a different reading of
+the same instant, and `reindex` must rebuild the same numbers the wrapper wrote.
+`_NOTICE` marks a line this extension emitted rather than the job (currently only
+`truncated`), which is how the output tail stays what the job actually said.
 
 Because management actions are journalled with the same `PROXMOD_CRON_JOB` field,
 one query answers the question that actually gets asked during an incident:
@@ -288,7 +297,9 @@ What an administrator uses when the web interface is not reachable.
 
 `doctor` is the one to run first when something is not firing: it checks journal
 persistence and rate limits, `MAILTO` versus `track`, unreadable stores, and
-plugin modules a store references but that will not load.
+plugin modules a store references but that will not load. It exits **0** with
+nothing to report, **1** when it emitted warnings and **2** when it emitted
+errors, so it can be the command a monitoring check runs.
 
 ---
 

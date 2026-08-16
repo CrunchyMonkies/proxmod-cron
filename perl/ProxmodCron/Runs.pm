@@ -140,12 +140,20 @@ sub output {
     my $last_cursor;
 
     for my $entry (@$entries) {
-        push @lines, {
+        my $line = {
             stream => _field($entry, 'PROXMOD_CRON_STREAM') || 'stdout',
             priority => _field($entry, 'PRIORITY'),
             time => _usec($entry->{__REALTIME_TIMESTAMP}),
             text => _sanitise(_field($entry, 'MESSAGE')),
         };
+
+        # Present only on lines this extension wrote rather than lines the job
+        # did — currently just the truncation notice. The log view shows them;
+        # the status cache's tail leaves them out.
+        my $notice = _field($entry, 'PROXMOD_CRON_NOTICE');
+        $line->{notice} = $notice if defined $notice;
+
+        push @lines, $line;
         $last_cursor = $entry->{__CURSOR} if defined $entry->{__CURSOR};
     }
 
@@ -236,11 +244,19 @@ sub fold {
 
         $record->{cursor} = $entry->{__CURSOR} if defined $entry->{__CURSOR};
 
+        # The wrapper's own reading of when the run began, on both its start and
+        # its finish record. Preferred over journald's receive timestamp because
+        # it is the number proxmod-cron-exec wrote into the status cache, and a
+        # reindex that used the other clock would rebuild a cache that differs
+        # from the original by a second for no reason a user could explain.
+        my $stamped = _int(_field($entry, 'PROXMOD_CRON_STARTED'));
+
         if ($event eq 'start') {
-            $record->{started} = $time;
+            $record->{started} = defined($stamped) ? $stamped : $time;
             $record->{user} = _field($entry, 'PROXMOD_CRON_USER')
                 if defined _field($entry, 'PROXMOD_CRON_USER');
         } elsif ($event eq 'finish') {
+            $record->{started} = $stamped if defined $stamped;
             $record->{finished} = $time;
             $record->{exit} = _int(_field($entry, 'PROXMOD_CRON_EXIT'));
             $record->{signal} = _int(_field($entry, 'PROXMOD_CRON_SIGNAL'));
@@ -257,6 +273,15 @@ sub fold {
     my @out;
     for my $run (@order) {
         my $record = $runs{$run};
+
+        # proxmod-cron-exec derives its cache's `finished` from its own start
+        # time plus the duration it measured, so derive it the same way rather
+        # than from when journald happened to receive the finish record. Done
+        # here, not in the fold above, so it does not depend on the start and
+        # finish entries arriving in either order.
+        $record->{finished} = $record->{started} + int($record->{duration_ms} / 1000)
+            if defined $record->{started} && defined $record->{duration_ms};
+
         $record->{state} = state_of($record);
         # A record with no start at all is an output or finish entry whose start
         # has aged out of the journal. Report it rather than hiding it — the

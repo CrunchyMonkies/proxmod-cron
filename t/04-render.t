@@ -251,16 +251,16 @@ subtest 'a disabled job is commented out, not removed' => sub {
 };
 
 subtest 'tracked jobs render through the wrapper, untracked ones do not' => sub {
-    plan tests => 5;
+    plan tests => 6;
 
     my $exec = $ProxmodCron::Render::EXEC;
 
     my $tracked = cron_line(render('node', one(), 'pve1'));
-    is($tracked, "30 2 * * *\troot\t$exec node only-job -- /bin/true",
-        'the wrapper is given the scope and the job id, then -- then the argv');
+    is($tracked, "30 2 * * *\troot\t$exec node only-job --type command -- /bin/true",
+        'the wrapper is given the scope, the job id and the type, then -- then the argv');
 
     my $quiet = cron_line(render('node', one(keep_output => 0), 'pve1'));
-    is($quiet, "30 2 * * *\troot\t$exec node only-job --no-output -- /bin/true",
+    is($quiet, "30 2 * * *\troot\t$exec node only-job --no-output --type command -- /bin/true",
         'keep_output: false is a flag to the wrapper, not a different code path');
 
     my $bare = cron_line(render('node', one(track => 0), 'pve1'));
@@ -268,8 +268,16 @@ subtest 'tracked jobs render through the wrapper, untracked ones do not' => sub 
         'an untracked job runs its command directly, with nothing in between');
 
     my $cluster = cron_line(render('cluster', one(), 'pve1'));
-    like($cluster, qr/\Q$exec\E cluster only-job --/,
+    like($cluster, qr/\Q$exec\E cluster only-job /,
         'the scope in the wrapper is the store the job came from');
+
+    # The type is carried on the line so PROXMOD_CRON_TYPE describes the
+    # definition that produced this argv, not whatever the store says by the time
+    # the job runs.
+    my $typed = cron_line(render('node', one(type => 'acme-backup',
+        vmid => 101, command => undef), 'pve1'));
+    like($typed, qr/\Qonly-job --type acme-backup --\E/,
+        "the plugin type reaches the wrapper as the type it was rendered from");
 
     # The wrapper's arguments are quoted by the same code as the job's, so a job
     # id that needed quoting would still be one argument. Ids cannot contain a
