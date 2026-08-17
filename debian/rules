@@ -7,9 +7,15 @@
 # what it is, installed by the Makefile like any other file under /etc, and
 # dh_installdeb registers everything under /etc as a conffile on its own.
 #
-# The test suite is not run here. It is run in CI, where a failure is visible;
-# running it during a package build would make an unbuildable package out of an
-# unrelated environment problem on the build host.
-
 %:
 	dh $@
+
+# The test suite is not run here. It is run in CI, where a failure is visible;
+# running it during a package build would make an unbuildable package out of an
+# unrelated environment problem on the build host — and the failure surfaces as
+# a build that stops with no obvious connection to the tests, because
+# dh_auto_test's output is buried in the middle of a package build.
+#
+# This override is what makes that true: the Makefile has a `test` target, and
+# without an empty override here dh's makefile buildsystem finds it and runs it.
+override_dh_auto_test:

@@ -14,6 +14,10 @@ proxmod-cron (202608.17.0) unstable; urgency=medium
     job moves to a surviving node with no leader, heartbeat or election. A node
     that is not quorate stands down from every cluster-scoped job and records a
     skip; node-scoped jobs and standalone hosts are unaffected.
+  * Journal writes are bounded: a journald that has stopped draining its socket
+    can no longer block a running job inside a log write, which would have held
+    the job's run lock indefinitely. The entry falls to logger and then to
+    stderr, as it already did for a missing socket.
   * Access control expressed entirely in existing PVE privileges on existing
     ACL paths, with per-job delegation for job types that declare what object
     they are about.

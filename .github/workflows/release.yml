@@ -30,7 +30,7 @@ jobs:
         run: |
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential debhelper devscripts perl fakeroot
+            build-essential debhelper devscripts perl libtest-simple-perl fakeroot
           useradd -m ci
           chown -R ci:ci .
           chown ci:ci ..
@@ -65,6 +65,17 @@ jobs:
               exit 1
             fi
           done
+
+      # ci.yml runs the suite on pushes to main, which is not the same commit
+      # test as "the commit this tag points at". debian/rules deliberately does
+      # not run tests during the build, so without this step a release could
+      # ship code no run of the suite ever saw.
+      #
+      # PROXMOD_CRON_TEST_PREFIX — what redirects every path into a disposable
+      # tree — is honoured only when the effective UID is not 0, so the suite
+      # runs as the same non-root user that builds the package.
+      - name: prove -r t/
+        run: su ci -c 'umask 022 && prove -r t/'
 
       # Rules-Requires-Root: no in debian/control means this package is built by
       # a non-root user, with fakeroot faking root only where dpkg needs it.

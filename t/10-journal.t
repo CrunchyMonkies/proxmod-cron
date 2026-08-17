@@ -31,7 +31,7 @@ use ProxmodCron::Journal;
 # would not prove the string is one journald would accept, and the wire format
 # is the entire contract.
 
-plan tests => 10;
+plan tests => 11;
 
 # A socket of this test's own, rather than ProxmodCronTest::journal_sink, so the
 # receiver can be closed and rebound underneath the module — which is what
@@ -397,4 +397,57 @@ subtest 'job_fields tags every entry about a job the same way' => sub {
         'under one field, which is what makes them one timeline');
 
     close($sock);
+};
+
+subtest 'a receiver that stops reading is abandoned, not waited on forever' => sub {
+    plan tests => 5;
+
+    # The failure this guards against wedged the whole suite in CI and would
+    # wedge a real cron job the same way: a datagram socket nobody is draining
+    # fills up, and send() on it blocks with no timeout. journald stopped while
+    # systemd still holds its socket looks exactly like this from here, and so
+    # does any container, where a fresh network namespace caps the queue at ten
+    # datagrams rather than the host's five hundred. A job blocked inside a log
+    # write holds its run lock and never finishes — much worse than a lost line.
+    my ($sock, $drain) = sink($SOCK_PATH);
+
+    # Short, because the assertion is "it gave up", not "it gave up in exactly
+    # two seconds", and the test should not spend the production timeout.
+    local $ProxmodCron::Journal::SEND_TIMEOUT = 0.2;
+    ProxmodCron::Journal::reset();
+
+    my @logged;
+    no warnings 'redefine';
+    local *ProxmodCron::Journal::_send_logger = sub { push @logged, [@_]; return 1 };
+
+    # Enough to overflow the shortest queue any of these environments imposes,
+    # and never read back.
+    my $start = time();
+    ProxmodCron::Journal::send_entry({ MESSAGE => "filler $_" }) for 1 .. 40;
+    my $elapsed = time() - $start;
+
+    ok($elapsed < 10, "forty entries into a full socket took ${elapsed}s, not forever");
+
+    # On a host with a long queue nothing overflows and the ladder is never
+    # reached, which is also correct — so the claim is about what happens when
+    # it *is* reached, not that it must be.
+    my $received = scalar @{ $drain->() };
+    ok($received + scalar(@logged) >= 40, 'and every entry either arrived or fell to the ladder');
+
+  SKIP: {
+        skip 'the queue never filled on this host', 3 if !@logged;
+
+        ok(ProxmodCron::Journal::send_entry({ MESSAGE => 'after' }),
+            'a send after the timeout still reports success');
+        is(scalar(@logged), 41 - $received,
+            'and goes straight down the ladder without paying the timeout again');
+
+        # Reconnecting on the next entry would mean paying the timeout once per
+        # line for the rest of the run. A receiver that was not draining a moment
+        # ago will not be draining for the next line either.
+        is($logged[-1][1], 'after', 'the abandoned socket is not retried');
+    }
+
+    close($sock);
+    ProxmodCron::Journal::reset();
 };

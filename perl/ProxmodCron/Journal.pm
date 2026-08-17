@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 use POSIX ();
-use Socket qw(AF_UNIX SOCK_DGRAM);
+use Socket qw(AF_UNIX SOCK_DGRAM SOL_SOCKET SO_SNDTIMEO);
 
 # Structured journald entries, in pure Perl.
 #
@@ -52,6 +52,17 @@ our $FALLBACK_FH;
 our $MAX_MESSAGE = 16 * 1024;
 
 our $IDENTIFIER = 'proxmod-cron';
+
+# A datagram socket nobody is reading fills up, and then send() blocks — with no
+# timeout, forever. journald stopped while systemd still holds its socket is
+# exactly that shape, and so is any process whose receive queue is short: a fresh
+# network namespace caps AF_UNIX datagrams at ten (`net.unix.max_dgram_qlen`),
+# not the host's 512. A cron job wedged inside a log write would hold its run
+# lock and never finish, which is a far worse failure than a lost log line. So
+# the send is bounded, and a socket that times out is abandoned for the rest of
+# the process — if journald is not draining now it will not be draining for the
+# next line either, and the ladder below is there for exactly this.
+our $SEND_TIMEOUT = 2;
 
 # Fixed 128-bit ids, one per event class. This is what makes a query exact:
 # `journalctl MESSAGE_ID=<FINISH>` returns run completions and nothing else,
@@ -204,6 +215,15 @@ sub _socket {
         return undef;
     }
 
+    # struct timeval, whose members are time_t and suseconds_t — 'l!' is the
+    # native long both are on every platform this package runs on. A kernel that
+    # refuses the option is not a reason to give up logging; it only means the
+    # send is unbounded again, which is where we started.
+    my $timeout = $SEND_TIMEOUT;
+    $timeout = 0 if !defined $timeout || $timeout < 0;
+    setsockopt($fh, SOL_SOCKET, SO_SNDTIMEO,
+        pack('l!l!', int($timeout), int(($timeout - int($timeout)) * 1_000_000)));
+
     $sock = $fh;
     return $sock;
 }
@@ -217,6 +237,18 @@ sub _send_native {
     for my $attempt (1, 2) {
         my $sent = CORE::send($fh, $payload, 0);
         return 1 if defined $sent;
+
+        # EAGAIN here is SO_SNDTIMEO expiring, which means the receiver's queue
+        # stayed full for the whole timeout. Retrying would just spend the
+        # timeout again, so stop using this socket entirely and let the caller
+        # fall down the ladder for every remaining entry.
+        my $err = $!;
+        if ($err == POSIX::EAGAIN() || $err == POSIX::EWOULDBLOCK()) {
+            close($fh);
+            undef $sock;
+            $sock_failed = 1;
+            return 0;
+        }
 
         # ENOBUFS means journald is momentarily behind rather than gone. One
         # retry is worth it; a loop here would block the job.

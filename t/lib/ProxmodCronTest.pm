@@ -257,18 +257,56 @@ sub journal_sink {
     # on the fallback ladder with no visible failure.
     ProxmodCron::Journal::reset();
 
-    return sub {
-        my @entries;
-
+    my @held;
+    my $sweep = sub {
         while (1) {
             my $buf;
             last if !defined recv($sock, $buf, 256 * 1024, 0);
             last if !defined $buf || $buf eq '';
-            push @entries, _parse_journal_datagram($buf);
+            push @held, _parse_journal_datagram($buf);
         }
+        return;
+    };
 
+    # A socket nobody reads is a socket that fills, and a full AF_UNIX datagram
+    # queue makes send() block — which is how the whole suite deadlocks in a
+    # container, where a fresh network namespace caps the queue at ten datagrams
+    # instead of the host's five hundred. Most tests here call journal_sink()
+    # only to keep entries off the real journal and never drain it, so the queue
+    # is emptied after every send instead of when someone remembers to ask. The
+    # datagram still crosses a real socket, which is the point of using one.
+    _wrap_journal_send($sweep);
+
+    return sub {
+        $sweep->();
+        my @entries = @held;
+        @held = ();
         return \@entries;
     };
+}
+
+# Installed once per process. A second journal_sink() replaces the sweep rather
+# than stacking another wrapper on top of the first.
+our $JOURNAL_SWEEP;
+
+sub _wrap_journal_send {
+    my ($sweep) = @_;
+
+    my $already = defined $JOURNAL_SWEEP;
+    $JOURNAL_SWEEP = $sweep;
+    return if $already;
+
+    my $inner = \&ProxmodCron::Journal::_send_native;
+
+    no strict 'refs';       ## no critic
+    no warnings 'redefine'; ## no critic
+    *ProxmodCron::Journal::_send_native = sub {
+        my $sent = $inner->(@_);
+        $JOURNAL_SWEEP->() if $JOURNAL_SWEEP;
+        return $sent;
+    };
+
+    return;
 }
 
 # The native protocol, read back: KEY=value\n for a simple value, or KEY\n, a
