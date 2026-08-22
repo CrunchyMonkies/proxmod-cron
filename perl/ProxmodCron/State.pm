@@ -25,7 +25,7 @@ use ProxmodCron::Config;
 # a Sys.Audit-only caller must strip it. strip_output() below is that call, so
 # there is one implementation of the rule.
 
-our $VERSION = '202608.17.0';
+our $VERSION = '202608.22.0';
 
 our $TAIL_LINES = 20;
 

@@ -32,7 +32,7 @@ use ProxmodCron::Config;
 # whether /etc/pve exists as a directory — a stat any user may make — rather
 # than by whether .members could be read, which a non-root user never can.
 
-our $VERSION = '202608.17.0';
+our $VERSION = '202608.22.0';
 
 our $CACHE_VERSION = 1;
 

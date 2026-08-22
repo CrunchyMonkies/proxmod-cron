@@ -26,7 +26,7 @@ use ProxmodCron::Sync;
 # No PVE and no proxmod here, deliberately: `proxmodctl disable` stops
 # management, not execution, and this must keep working when it has.
 
-our $VERSION = '202608.17.0';
+our $VERSION = '202608.22.0';
 
 our @PLUGIN_ERRORS;
 

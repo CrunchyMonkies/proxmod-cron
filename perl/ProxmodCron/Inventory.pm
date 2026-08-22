@@ -18,7 +18,7 @@ use ProxmodCron::Spec;
 # makes this extension safe to install is that it only ever writes the two files
 # it generates.
 
-our $VERSION = '202608.17.0';
+our $VERSION = '202608.22.0';
 
 # run-parts schedules as Debian's stock /etc/crontab defines them. Reported as
 # nominal because an administrator may have changed that file — the run-parts

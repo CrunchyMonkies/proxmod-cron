@@ -458,7 +458,7 @@ panel. **`renderCommand`'s return value is HTML-encoded before it is displayed**
 ### The rest of the namespace
 
 ```js
-ProxmodCron.version                                  // '202608.17.0'
+ProxmodCron.version                                  // '202608.22.0'
 
 ProxmodCron.api.list(scope, opts)                    // scope: 'cluster' | 'node'
 ProxmodCron.api.get(scope, id, opts)

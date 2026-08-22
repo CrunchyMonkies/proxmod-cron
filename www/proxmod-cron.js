@@ -12,7 +12,7 @@
 // thrown in an unguarded listener is uncaught — so anything we attach ourselves
 // goes through Proxmod.guard.
 //
-// Two rules that are not style:
+// Three rules that are not style:
 //
 //   1. Every value that reaches a renderer, a template or a tooltip goes
 //      through Ext.String.htmlEncode. Job comments, commands and — above all —
@@ -24,9 +24,15 @@
 //      (§8) and the origin rule (§2.1). A second copy of that logic in
 //      JavaScript is a copy that will drift, and the server checks every call
 //      regardless.
+//   3. No 'use strict'. ExtJS resolves callParent by reading Function.caller on
+//      the calling method, and V8 hands out null for that whenever the caller
+//      is a strict-mode function — every callParent below would die inside
+//      ext-all.js with "Cannot read properties of null (reading 'apply')".
+//      Strictness is inherited by nested functions, so it is the whole file or
+//      nothing.
 
 (function () {
-    'use strict';
+    // Deliberately sloppy mode: callParent needs it. See rule 3 above.
 
     // proxmod can be disabled by an administrator without this package being
     // removed, and then there is nothing to register against.
@@ -35,7 +41,7 @@
     }
 
     var EXT = 'cron';
-    var VERSION = '202608.17.0';
+    var VERSION = '202608.22.0';
 
     // PVE's own, always present in the workspace. The fallback is for the
     // moment before the translation table is built, not for a page without it.

@@ -23,7 +23,7 @@ use ProxmodCron::Store;
 # loaded by proxmod-cron-sync from cron under a bare perl with no PVE at all,
 # and the ProxmodCron::API2::* modules below are the boundary where that stops.
 
-our $VERSION = '202608.17.0';
+our $VERSION = '202608.22.0';
 
 sub proxmod_register {
     my ($api) = @_;

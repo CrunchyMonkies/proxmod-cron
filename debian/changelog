@@ -1,3 +1,23 @@
+proxmod-cron (202608.22.0) unstable; urgency=medium
+
+  * Frontend: the asset no longer runs in strict mode. ExtJS resolves
+    callParent by reading Function.caller on the calling method, and V8 hands
+    out null for that whenever the caller is a strict-mode function, so every
+    callParent in this file failed inside ext-all.js with "Cannot read
+    properties of null (reading 'apply')" and the panel it belonged to never
+    built. Strictness is inherited by nested functions, so the directive is
+    gone from the file rather than from one method. Needs proxmod 0.2.1, which
+    carried the same defect in its own asset.
+  * Logging never blocks a job. A journald datagram socket nobody is draining
+    fills up and send() on it blocks with no timeout — every container, where a
+    fresh network namespace caps net.unix.max_dgram_qlen at ten. A job wedged
+    inside a log write holds its run lock forever, which is far worse than a
+    lost log line, so the send is bounded by SO_SNDTIMEO and a socket that
+    times out is abandoned for the rest of the process in favour of the
+    existing logger/stderr ladder.
+
+ -- proxmod maintainers <proxmod@localhost>  Sat, 22 Aug 2026 00:00:00 +0000
+
 proxmod-cron (202608.17.0) unstable; urgency=medium
 
   * Initial release: cron management for Proxmox VE as a proxmod extension.

@@ -10,7 +10,7 @@ use warnings;
 # PVE::JSONSchema's — the shapes we accept are a small subset, and depending on
 # PVE would mean the renderer could not run.
 
-our $VERSION = '202608.17.0';
+our $VERSION = '202608.22.0';
 
 # Where plugin manifests live. One small JSON file per job type, naming the
 # module to load:

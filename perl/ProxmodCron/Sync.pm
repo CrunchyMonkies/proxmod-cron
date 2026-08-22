@@ -22,7 +22,7 @@ use ProxmodCron::State;
 #
 # No PVE, and no proxmod: the anchor runs this from cron.
 
-our $VERSION = '202608.17.0';
+our $VERSION = '202608.22.0';
 
 =head2 run(%opts)
 

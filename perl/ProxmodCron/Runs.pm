@@ -21,7 +21,7 @@ use ProxmodCron::Journal;
 #
 # No PVE here either: proxmod-cronctl calls this directly.
 
-our $VERSION = '202608.17.0';
+our $VERSION = '202608.22.0';
 
 our $JOURNALCTL = '/usr/bin/journalctl';
 
